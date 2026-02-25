@@ -1,4 +1,9 @@
 # -*- coding: utf-8 -*-
+"""
+细胞系构建智能评估系统
+Cell Line Construction Feasibility Assessment System
+整合 NCBI Gene | UniProt | Addgene | Human Protein Atlas
+"""
 
 import streamlit as st
 import pandas as pd
@@ -12,6 +17,7 @@ import json
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 import urllib.parse
+from collections import Counter
 
 # ==================== 配置与初始化 ====================
 st.set_page_config(
@@ -49,7 +55,7 @@ if 'analysis_results' not in st.session_state:
 if 'search_history' not in st.session_state:
     st.session_state.search_history = []
 
-# ==================== 核心数据获取模块 ====================
+# ==================== Addgene 爬取模块 ====================
 
 class AddgeneScraper:
     """优化的 Addgene 质粒爬取器"""
@@ -93,7 +99,7 @@ class AddgeneScraper:
                 except Exception:
                     continue
             
-            # 备用方案：直接访问基因页面
+            # 备用方案
             if not plasmids:
                 plasmids = _self._search_by_gene_page(gene_symbol)
             
@@ -185,6 +191,8 @@ class AddgeneScraper:
             return []
 
 
+# ==================== Human Protein Atlas 爬取模块 ====================
+
 class HumanAtlasScraper:
     """Human Protein Atlas 抗体信息爬取"""
     
@@ -208,7 +216,7 @@ class HumanAtlasScraper:
             soup = BeautifulSoup(response.text, 'lxml')
             antibodies = []
             
-            # 策略1：查找抗体表格
+            # 策略1：查找抗体链接
             ab_links = soup.find_all('a', href=re.compile(r'/ENSG\d+-\w+/antibody'))
             
             for link in ab_links[:5]:
@@ -296,6 +304,8 @@ class HumanAtlasScraper:
                 apps.append(value)
         return ', '.join(list(set(apps))) if apps else '未标注'
 
+
+# ==================== NCBI 数据获取模块 ====================
 
 class BioDataFetcher:
     """生物数据获取主类"""
@@ -462,6 +472,8 @@ class BioDataFetcher:
             return [], 0
 
 
+# ==================== 分析主类 ====================
+
 class ConstructAnalyzer:
     """细胞系构建分析主类"""
     
@@ -485,12 +497,12 @@ class ConstructAnalyzer:
             uniprot_info = self.fetcher.get_uniprot_info(gene_symbol, species)
             time.sleep(0.5)
             
-            # 3. Addgene（优化爬取）
+            # 3. Addgene
             st.text("深度检索 Addgene...")
             addgene_plasmids = self.fetcher.addgene_scraper.search_plasmids(gene_symbol)
             time.sleep(0.5)
             
-            # 4. HPA 抗体（优化爬取，仅人类）
+            # 4. HPA 抗体
             antibodies = []
             if species == "Homo sapiens":
                 st.text("检索 Human Protein Atlas...")
@@ -526,51 +538,51 @@ class ConstructAnalyzer:
             
             return result
     
-   def _assess_lentiviral(self, ncbi_info: Dict, uniprot_info: Dict, plasmids: List) -> Dict:
-    """评估慢病毒适用性"""
-    warnings = []
-    recommendations = []
-    score = 100  # 初始满分
-    cds_len = uniprot_info.get("cds_length_bp", 0)
-    
-    # 致死性判断
-    if ncbi_info.get("phenotype") == "必需（潜在致死风险）":
-        warnings.append("⚠️ 必需基因：建议使用诱导型系统（Tet-on/off）")
-        score -= 50
-    
-    # 序列长度判断
-    if cds_len > 9000:
-        warnings.append(f"⚠️ CDS {cds_len}bp 接近包装极限（10kb），包装效率可能降低")
-        score -= 20
-    elif cds_len > 12000:
-        warnings.append(f"❌ CDS {cds_len}bp 超出慢病毒包装能力")
-        score -= 80
-    
-    # Addgene资源
-    if plasmids:
-        recommendations.append(f"✅ Addgene 提供 {len(plasmids)} 个质粒")
-    else:
-        recommendations.append("ℹ️ Addgene 无现成质粒，需自行构建")
-    
-    # 根据score判断评级
-    if score >= 75:
-        rating = "✅ 推荐"
-        suitable = True
-    elif score >= 50:
-        rating = "⚠️ 谨慎"
-        suitable = True
-    else:
-        rating = "❌ 不推荐"
-        suitable = False
-    
-    return {
-        "suitable": suitable,
-        "score": score,
-        "warnings": warnings,
-        "recommendations": recommendations,
-        "overall_assessment": rating,
-        "cds_length": cds_len
-    }
+    def _assess_lentiviral(self, ncbi_info: Dict, uniprot_info: Dict, plasmids: List) -> Dict:
+        """评估慢病毒适用性"""
+        warnings = []
+        recommendations = []
+        score = 100  # 初始满分
+        cds_len = uniprot_info.get("cds_length_bp", 0)
+        
+        # 致死性判断
+        if ncbi_info.get("phenotype") == "必需（潜在致死风险）":
+            warnings.append("⚠️ 必需基因：建议使用诱导型系统（Tet-on/off）")
+            score -= 50
+        
+        # 序列长度判断
+        if cds_len > 9000:
+            warnings.append(f"⚠️ CDS {cds_len}bp 接近包装极限（10kb）")
+            score -= 20
+        elif cds_len > 12000:
+            warnings.append(f"❌ CDS {cds_len}bp 超出慢病毒包装能力")
+            score -= 80
+        
+        # Addgene资源
+        if plasmids:
+            recommendations.append(f"✅ Addgene 提供 {len(plasmids)} 个质粒")
+        else:
+            recommendations.append("ℹ️ Addgene 无现成质粒，需自行构建")
+        
+        # 评级
+        if score >= 75:
+            rating = "✅ 推荐"
+            suitable = True
+        elif score >= 50:
+            rating = "⚠️ 谨慎"
+            suitable = True
+        else:
+            rating = "❌ 不推荐"
+            suitable = False
+        
+        return {
+            "suitable": suitable,
+            "score": score,
+            "warnings": warnings,
+            "recommendations": recommendations,
+            "overall_assessment": rating,
+            "cds_length": cds_len
+        }
     
     def _search_all_constructs(self, gene_symbol: str, cell_line: Optional[str]) -> Dict:
         """检索所有构建方式"""
@@ -607,7 +619,6 @@ class ConstructAnalyzer:
             if methods:
                 all_methods.extend([m.strip() for m in methods.split(",")])
         
-        from collections import Counter
         method_counts = Counter(all_methods)
         return [f"{k} ({v})" for k, v in method_counts.most_common(3)]
     
@@ -833,7 +844,6 @@ def main():
                 st.session_state.search_history = []
                 st.rerun()
 
+
 if __name__ == "__main__":
-
     main()
-
