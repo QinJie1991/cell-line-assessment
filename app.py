@@ -526,46 +526,51 @@ class ConstructAnalyzer:
             
             return result
     
-    def _assess_lentiviral(self, ncbi_info: Dict, uniprot_info: Dict, plasmids: List) -> Dict:
-        """评估慢病毒适用性"""
-        warnings = []
-        recommendations = []
+   def _assess_lentiviral(self, ncbi_info: Dict, uniprot_info: Dict, plasmids: List) -> Dict:
+    """评估慢病毒适用性"""
+    warnings = []
+    recommendations = []
+    score = 100  # 初始满分
+    cds_len = uniprot_info.get("cds_length_bp", 0)
+    
+    # 致死性判断
+    if ncbi_info.get("phenotype") == "必需（潜在致死风险）":
+        warnings.append("⚠️ 必需基因：建议使用诱导型系统（Tet-on/off）")
+        score -= 50
+    
+    # 序列长度判断
+    if cds_len > 9000:
+        warnings.append(f"⚠️ CDS {cds_len}bp 接近包装极限（10kb），包装效率可能降低")
+        score -= 20
+    elif cds_len > 12000:
+        warnings.append(f"❌ CDS {cds_len}bp 超出慢病毒包装能力")
+        score -= 80
+    
+    # Addgene资源
+    if plasmids:
+        recommendations.append(f"✅ Addgene 提供 {len(plasmids)} 个质粒")
+    else:
+        recommendations.append("ℹ️ Addgene 无现成质粒，需自行构建")
+    
+    # 根据score判断评级
+    if score >= 75:
+        rating = "✅ 推荐"
         suitable = True
-        
-        # 致死性
-        if ncbi_info.get("phenotype") == "必需（潜在致死风险）":
-            warnings.append("⚠️ 必需基因：建议使用诱导型系统（Tet-on/off）")
-            suitable = False
-        
-        # 序列长度
-        cds_len = uniprot_info.get("cds_length_bp", 0)
-        if cds_len > 9000:
-            warnings.append(f"⚠️ CDS {cds_len}bp 接近包装极限（10kb）")
-        elif cds_len > 12000:
-            warnings.append(f"❌ CDS {cds_len}bp 超出慢病毒能力")
-            suitable = False
-        
-        # Addgene资源
-        if plasmids:
-            recommendations.append(f"✅ Addgene 提供 {len(plasmids)} 个质粒")
-        else:
-            recommendations.append("ℹ️ Addgene 无现成质粒，需自行构建")
-        
-        rating = "✅ 推荐" if score >= 75 else "⚠️ 谨慎" if score >= 50 else "❌ 不推荐"
-        if suitable and not warnings:
-            rating = "✅ 适合慢病毒包装"
-        elif warnings:
-            rating = "⚠️ 可行但需注意风险"
-        else:
-            rating = "❌ 不推荐慢病毒系统"
-        
-        return {
-            "suitable": suitable,
-            "warnings": warnings,
-            "recommendations": recommendations,
-            "overall_assessment": rating,
-            "cds_length": cds_len
-        }
+    elif score >= 50:
+        rating = "⚠️ 谨慎"
+        suitable = True
+    else:
+        rating = "❌ 不推荐"
+        suitable = False
+    
+    return {
+        "suitable": suitable,
+        "score": score,
+        "warnings": warnings,
+        "recommendations": recommendations,
+        "overall_assessment": rating,
+        "cds_length": cds_len
+    }
     
     def _search_all_constructs(self, gene_symbol: str, cell_line: Optional[str]) -> Dict:
         """检索所有构建方式"""
@@ -831,3 +836,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
