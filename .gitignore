@@ -1,0 +1,6 @@
+# 忽略 HPA 数据文件（这些会由程序自动下载）
+data/*.tsv
+data/*.tsv.zip
+
+# 忽略 Python 缓存（可选）
+__pycache__/
