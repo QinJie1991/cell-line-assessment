@@ -192,117 +192,148 @@ class AddgeneScraper:
 
 
 # ==================== Human Protein Atlas 爬取模块 ====================
-
-class HumanAtlasScraper:
-    """Human Protein Atlas 抗体信息爬取"""
+class HPAGeneData:
+    """
+    基于本地 proteinatlas.tsv 的人类蛋白表达数据查询
     
-    def __init__(self):
-        self.base_url = "https://www.proteinatlas.org"
-        self.ua = UserAgent()
-        self.session = requests.Session()
+    数据文件说明：
+    - 文件：data/proteinatlas.tsv（约 30MB）
+    - 来源：https://www.proteinatlas.org/download/proteinatlas.tsv.zip
+    - 首次使用时会自动下载，无需手动放置
+    """
     
-    @st.cache_data(ttl=86400, show_spinner=False)
-    def get_antibodies(_self, gene_symbol: str) -> List[Dict]:
-        """获取经验证的抗体列表"""
+    def __init__(self, tsv_path: str = "data/proteinatlas.tsv"):
+        self.tsv_path = tsv_path
+        self.df = None
+        self.required_columns = ['Gene', 'Ensembl', 'Uniprot', 
+                                'Subcellular main location', 'Reliability', 
+                                'RNA tissue specific nTPM']
+        
+        # 如果文件不存在，尝试自动下载
+        if not os.path.exists(self.tsv_path):
+            self._auto_download()
+        
+        self._load_data()
+    
+    def _auto_download(self):
+        """自动下载 HPA 数据文件（首次使用）"""
         try:
-            search_url = f"{_self.base_url}/{gene_symbol}"
-            time.sleep(1)
-            headers = {'User-Agent': _self.ua.random}
+            import requests
+            import zipfile
+            import io
             
-            response = _self.session.get(search_url, headers=headers, timeout=15)
-            if response.status_code != 200:
-                return []
+            st.warning("⬇️ 首次使用，正在下载 HPA 数据文件（约 30MB，请耐心等待）...")
             
-            soup = BeautifulSoup(response.text, 'lxml')
-            antibodies = []
+            # 创建 data 目录
+            os.makedirs("data", exist_ok=True)
             
-            # 策略1：查找抗体链接
-            ab_links = soup.find_all('a', href=re.compile(r'/ENSG\d+-\w+/antibody'))
+            url = "https://www.proteinatlas.org/download/proteinatlas.tsv.zip"
             
-            for link in ab_links[:5]:
-                try:
-                    ab_url = link.get('href')
-                    if ab_url.startswith('/'):
-                        ab_url = f"{_self.base_url}{ab_url}"
-                    
-                    ab_info = _self._parse_antibody_page(ab_url, gene_symbol)
-                    if ab_info:
-                        antibodies.append(ab_info)
-                except Exception:
-                    continue
+            # 显示进度
+            progress_bar = st.progress(0)
+            status_text = st.empty()
             
-            # 策略2：解析页面上的抗体列表
-            if not antibodies:
-                rows = soup.find_all('tr', class_=lambda x: x and 'antibody' in x.lower())
-                for row in rows[:5]:
-                    cells = row.find_all('td')
-                    if len(cells) >= 3:
-                        ab_id = cells[0].get_text(strip=True)
-                        apps = _self._parse_applications(cells[1].get_text())
-                        reliability = cells[2].get_text(strip=True)
-                        
-                        antibodies.append({
-                            'gene': gene_symbol,
-                            'antibody_id': ab_id,
-                            'source': 'HPA',
-                            'applications': apps,
-                            'reliability': reliability,
-                            'vendor': 'Atlas Antibodies',
-                            'link': search_url
-                        })
+            # 流式下载（显示进度）
+            response = requests.get(url, stream=True, timeout=300)
+            response.raise_for_status()
             
-            return antibodies
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            chunk_size = 1024 * 1024  # 1MB chunks
             
+            # 下载到内存
+            zip_buffer = io.BytesIO()
+            
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if chunk:
+                    zip_buffer.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        progress = min(downloaded / total_size, 1.0)
+                        progress_bar.progress(progress)
+                        status_text.text(f"下载进度: {downloaded/1024/1024:.1f} MB / {total_size/1024/1024:.1f} MB")
+            
+            status_text.text("正在解压...")
+            progress_bar.empty()
+            
+            # 解压
+            zip_buffer.seek(0)
+            with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
+                zip_ref.extractall("data")
+            
+            # 验证文件是否存在
+            if os.path.exists(self.tsv_path):
+                st.success("✅ HPA 数据下载完成！下次启动将直接使用本地文件。")
+                time.sleep(2)  # 让用户看到成功消息
+            else:
+                raise FileNotFoundError("解压后未找到 proteinatlas.tsv 文件")
+                
         except Exception as e:
-            st.warning(f"Human Atlas 查询失败: {e}")
-            return []
+            st.error(f"❌ 自动下载失败: {e}")
+            st.info("""
+            **请手动下载：**
+            1. 访问 https://www.proteinatlas.org/download
+            2. 下载 `proteinatlas.tsv.zip`
+            3. 解压到 `data/` 文件夹内（即 `data/proteinatlas.tsv`）
+            4. 重新运行程序
+            """)
     
-    def _parse_antibody_page(self, url: str, gene_symbol: str) -> Optional[Dict]:
-        """解析单个抗体页面"""
+    def _load_data(self):
+        """加载 TSV 文件"""
         try:
-            time.sleep(0.5)
-            headers = {'User-Agent': self.ua.random}
-            response = self.session.get(url, headers=headers, timeout=10)
-            soup = BeautifulSoup(response.text, 'lxml')
+            if not os.path.exists(self.tsv_path):
+                st.warning("⚠️ HPA 数据文件未找到，且自动下载失败")
+                self.df = pd.DataFrame()
+                return
             
-            # 提取抗体ID
-            ab_id_match = re.search(r'(HPA\d{6}|CAB\d{6})', url)
-            ab_id = ab_id_match.group(1) if ab_id_match else "Unknown"
+            # 只读取需要的列，节省内存
+            self.df = pd.read_csv(
+                self.tsv_path, 
+                sep='\t', 
+                low_memory=False,
+                usecols=self.required_columns,
+                dtype={'Gene': str, 'Ensembl': str, 'Uniprot': str}
+            )
             
-            # 提取应用
-            app_text = soup.get_text()
-            applications = self._parse_applications(app_text)
+            st.success(f"✅ HPA 人类蛋白数据已加载: {len(self.df):,} 条基因记录")
             
-            # 可靠性判断
-            reliability = "Enhanced" if "enhanced" in app_text.lower() else \
-                         "Supported" if "supported" in app_text.lower() else "Uncertain"
+        except ValueError as e:
+            st.error(f"HPA 文件格式错误: {e}")
+            st.info("请删除 data/ 文件夹后重新运行，让程序重新下载")
+            self.df = pd.DataFrame()
+        except Exception as e:
+            st.error(f"加载 HPA 数据失败: {e}")
+            self.df = pd.DataFrame()
+    
+    def get_gene_data(self, gene_symbol: str) -> Dict:
+        """获取指定基因的表达数据"""
+        if self.df is None or self.df.empty:
+            return {}
+        
+        try:
+            matches = self.df[self.df['Gene'].str.upper() == gene_symbol.upper()]
+            
+            if matches.empty:
+                return {}
+            
+            row = matches.iloc[0]
             
             return {
-                'gene': gene_symbol,
-                'antibody_id': ab_id,
-                'source': 'HPA',
-                'applications': applications,
-                'reliability': reliability,
-                'vendor': 'Atlas Antibodies',
-                'link': url
+                'ensembl_id': str(row.get('Ensembl', '')),
+                'uniprot_id': str(row.get('Uniprot', '')),
+                'subcellular_location': str(row.get('Subcellular main location', '')),
+                'reliability': str(row.get('Reliability', '')),
+                'rna_tissue_specificity': str(row.get('RNA tissue specific nTPM', '')),
+                'hpa_link': f"https://www.proteinatlas.org/{row.get('Ensembl', '')}"
             }
-        except Exception:
-            return None
+            
+        except Exception as e:
+            st.error(f"查询 HPA 基因数据失败: {e}")
+            return {}
     
-    def _parse_applications(self, text: str) -> str:
-        """解析应用类型"""
-        apps = []
-        text_lower = text.lower()
-        app_map = {
-            'western blot': 'WB', 'wb': 'WB',
-            'immunohistochemistry': 'IHC', 'ihc': 'IHC',
-            'immunofluorescence': 'IF', 'if': 'IF',
-            'icc-if': 'ICC-IF', 'flow cytometry': 'FACS', 'facs': 'FACS'
-        }
-        for key, value in app_map.items():
-            if key in text_lower:
-                apps.append(value)
-        return ', '.join(list(set(apps))) if apps else '未标注'
+    def check_data_available(self) -> bool:
+        """检查数据是否可用"""
+        return self.df is not None and not self.df.empty
 
 
 # ==================== NCBI 数据获取模块 ====================
@@ -847,3 +878,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
