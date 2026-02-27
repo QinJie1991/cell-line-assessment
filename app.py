@@ -200,9 +200,17 @@ class HPAGeneData:
     def __init__(self, tsv_path: str = "data/proteinatlas.tsv"):
         self.tsv_path = tsv_path
         self.df = None
-        self.required_columns = ['Gene', 'Ensembl', 'Uniprot', 
-                                'Subcellular main location', 'Reliability', 
-                                'RNA tissue specific nTPM']
+        self.available_columns = []
+        
+        # 期望的列（按优先级）
+        self.desired_columns = {
+            'Gene': 'Gene',
+            'Ensembl': 'Ensembl',
+            'Uniprot': 'Uniprot',
+            'Subcellular main location': 'Subcellular main location',
+            'Reliability': 'Reliability',
+            'RNA tissue specific nTPM': 'RNA tissue specific nTPM'
+        }
         
         # 如果文件不存在，尝试自动下载
         if not os.path.exists(self.tsv_path):
@@ -215,24 +223,19 @@ class HPAGeneData:
         try:
             st.warning("⬇️ 首次使用，正在下载 HPA 数据文件（约 30MB，请耐心等待）...")
             
-            # 创建 data 目录
             os.makedirs("data", exist_ok=True)
-            
             url = "https://www.proteinatlas.org/download/proteinatlas.tsv.zip"
             
-            # 显示进度
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # 流式下载（显示进度）
             response = requests.get(url, stream=True, timeout=300)
             response.raise_for_status()
             
             total_size = int(response.headers.get('content-length', 0))
             downloaded = 0
-            chunk_size = 1024 * 1024  # 1MB chunks
+            chunk_size = 1024 * 1024
             
-            # 下载到内存
             zip_buffer = io.BytesIO()
             
             for chunk in response.iter_content(chunk_size=chunk_size):
@@ -246,55 +249,70 @@ class HPAGeneData:
             
             status_text.text("正在解压...")
             
-            # 解压
             zip_buffer.seek(0)
             with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
                 zip_ref.extractall("data")
             
-            # 清理
             progress_bar.empty()
             status_text.empty()
             
-            # 验证文件是否存在
             if os.path.exists(self.tsv_path):
-                st.success("✅ HPA 数据下载完成！下次启动将直接使用本地文件。")
-                time.sleep(2)
+                st.success("✅ HPA 数据下载完成！")
+                time.sleep(1)
             else:
-                raise FileNotFoundError("解压后未找到 proteinatlas.tsv 文件")
+                raise FileNotFoundError("解压后未找到 proteinatlas.tsv")
                 
         except Exception as e:
             st.error(f"❌ 自动下载失败: {e}")
-            st.info("""
-            **请手动下载：**
-            1. 访问 https://www.proteinatlas.org/download
-            2. 下载 `proteinatlas.tsv.zip`
-            3. 解压到 `data/` 文件夹内（即 `data/proteinatlas.tsv`）
-            4. 重新运行程序
-            """)
     
     def _load_data(self):
-        """加载 TSV 文件"""
+        """加载 TSV 文件（自动检测列名）"""
         try:
             if not os.path.exists(self.tsv_path):
                 st.warning("⚠️ HPA 数据文件未找到")
                 self.df = pd.DataFrame()
                 return
             
-            # 只读取需要的列，节省内存
+            # 先读取第一行看看有哪些列
+            sample_df = pd.read_csv(self.tsv_path, sep='\t', nrows=2)
+            actual_columns = sample_df.columns.tolist()
+            
+            # 找出实际存在的列（不区分大小写，容忍空格差异）
+            column_mapping = {}
+            for desired_col in self.desired_columns.keys():
+                # 精确匹配
+                if desired_col in actual_columns:
+                    column_mapping[desired_col] = desired_col
+                else:
+                    # 尝试不区分大小写匹配
+                    for actual_col in actual_columns:
+                        if actual_col.lower().strip() == desired_col.lower().strip():
+                            column_mapping[desired_col] = actual_col
+                            break
+            
+            if not column_mapping:
+                st.error("HPA 文件中没有找到任何期望的列")
+                self.df = pd.DataFrame()
+                return
+            
+            # 只读取存在的列
+            cols_to_read = list(column_mapping.values())
             self.df = pd.read_csv(
                 self.tsv_path, 
                 sep='\t', 
                 low_memory=False,
-                usecols=self.required_columns,
-                dtype={'Gene': str, 'Ensembl': str, 'Uniprot': str}
+                usecols=cols_to_read,
+                dtype=str  # 全部作为字符串读取，避免类型问题
             )
             
-            st.success(f"✅ HPA 人类蛋白数据已加载: {len(self.df):,} 条基因记录")
+            # 重命名为标准名称
+            reverse_mapping = {v: k for k, v in column_mapping.items()}
+            self.df = self.df.rename(columns=reverse_mapping)
             
-        except ValueError as e:
-            st.error(f"HPA 文件格式错误: {e}")
-            st.info("请删除 data/ 文件夹后重新运行，让程序重新下载")
-            self.df = pd.DataFrame()
+            self.available_columns = list(column_mapping.keys())
+            
+            st.success(f"✅ HPA 数据已加载: {len(self.df):,} 条基因 (可用字段: {', '.join(self.available_columns)})")
+            
         except Exception as e:
             st.error(f"加载 HPA 数据失败: {e}")
             self.df = pd.DataFrame()
@@ -312,14 +330,24 @@ class HPAGeneData:
             
             row = matches.iloc[0]
             
-            return {
-                'ensembl_id': str(row.get('Ensembl', '')),
-                'uniprot_id': str(row.get('Uniprot', '')),
-                'subcellular_location': str(row.get('Subcellular main location', '')),
-                'reliability': str(row.get('Reliability', '')),
-                'rna_tissue_specificity': str(row.get('RNA tissue specific nTPM', '')),
-                'hpa_link': f"https://www.proteinatlas.org/{row.get('Ensembl', '')}"
-            }
+            # 只返回实际存在的字段
+            result = {}
+            if 'Ensembl' in self.available_columns:
+                result['ensembl_id'] = str(row.get('Ensembl', ''))
+            if 'Uniprot' in self.available_columns:
+                result['uniprot_id'] = str(row.get('Uniprot', ''))
+            if 'Subcellular main location' in self.available_columns:
+                result['subcellular_location'] = str(row.get('Subcellular main location', ''))
+            if 'Reliability' in self.available_columns:
+                result['reliability'] = str(row.get('Reliability', ''))
+            if 'RNA tissue specific nTPM' in self.available_columns:
+                result['rna_tissue_specificity'] = str(row.get('RNA tissue specific nTPM', ''))
+            
+            # 构建链接（如果有 Ensembl）
+            if 'ensembl_id' in result and result['ensembl_id']:
+                result['hpa_link'] = f"https://www.proteinatlas.org/{result['ensembl_id']}"
+            
+            return result
             
         except Exception as e:
             st.error(f"查询 HPA 基因数据失败: {e}")
@@ -1046,3 +1074,4 @@ def display_results(result: Dict):
 
 if __name__ == "__main__":
     main()
+
