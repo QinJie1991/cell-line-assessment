@@ -1108,7 +1108,7 @@ def display_results(result: Dict):
     
     tabs = st.tabs(["🧬 基因功能", "🦠 慢病毒风险评估", "📚 文献与序列", "🧪 实验资源"])
     
-    # Tab 1: 基因功能
+    # Tab 1: 基因功能（保持不变）
     with tabs[0]:
         col1, col2, col3 = st.columns(3)
         
@@ -1158,7 +1158,7 @@ def display_results(result: Dict):
                 else:
                     st.info("HPA仅支持人类基因")
     
-    # Tab 2: 慢病毒风险评估
+    # Tab 2: 慢病毒风险评估（保持不变）
     with tabs[1]:
         lv = result["lentiviral_assessment"]
         
@@ -1171,19 +1171,16 @@ def display_results(result: Dict):
                    help="基于基因功能描述的风险评估")
         col3.metric("总体评级", lv['overall_rating'].split()[0])
         
-        # 警告信息
         if lv['warnings']:
             st.error("**⚠️ 风险提示:**")
             for warning in lv['warnings']:
                 st.write(f"- {warning}")
         
-        # 建议
         if lv['recommendations']:
             st.success("**💡 专家建议:**")
             for rec in lv['recommendations']:
                 st.write(f"- {rec}")
         
-        # 功能风险详情
         with st.expander("查看功能风险详情"):
             if lv['function_risk']['risks']:
                 for risk in lv['function_risk']['risks']:
@@ -1192,19 +1189,18 @@ def display_results(result: Dict):
                 st.write("未检测到特殊功能风险")
             st.info(f"**策略建议:** {lv['function_risk']['recommendation']}")
         
-        # 文献证据
         with st.expander("查看文献包装证据"):
             ev = lv['literature_evidence']['evidence']
             for construct, data in ev.items():
                 status = "✅" if data['available'] else "❌"
                 st.write(f"{status} **{construct}**: {data['count']}篇文献 ({data['method']})")
     
-    # Tab 3: 文献与序列
+    # Tab 3: 文献与序列（已修正）
     with tabs[2]:
         literature = result["cell_line_constructs"]
         lv = result["lentiviral_assessment"]
         
-        # 文献列表
+        # 文献列表（特定细胞系）
         if literature.get("specific_cell", {}).get("found"):
             st.success(literature["specific_cell"]["message"])
             
@@ -1227,34 +1223,99 @@ def display_results(result: Dict):
                         ai_data = data["ai_analysis"]
                         st.write(ai_data.get("summary", ""))
         
-        # 提取的序列
+        # 提取的序列（整合表格版）
         if lv.get('sequences'):
             st.divider()
             st.subheader("🧬 文献报道的靶点序列")
             
+            all_sequences = []
+            
             for construct_type, seqs in lv['sequences'].items():
-                if any(seqs.values()):
-                    with st.expander(f"{construct_type.upper()} 序列", expanded=True):
-                        for seq_type, entries in seqs.items():
-                            if entries:
-                                st.text(f"{seq_type.upper()} 序列 (来自文献):")
-                                for entry in entries:
-                                    cols = st.columns([2, 1, 3])
-                                    cols[0].code(entry['sequence'])
-                                    cols[1].caption(f"PMID: {entry['pmid']}")
-                                    cols[2].caption(entry['title'][:40])
+                for seq_type, entries in seqs.items():
+                    for entry in entries:
+                        seq = entry['sequence']
+                        gc_content = round((seq.count('G') + seq.count('C')) / len(seq) * 100, 1) if seq else 0
+                        
+                        all_sequences.append({
+                            "靶点类型": seq_type.upper(),
+                            "构建类型": construct_type.upper(),
+                            "序列 (5'-3')": seq,
+                            "长度(bp)": len(seq),
+                            "GC含量(%)": gc_content,
+                            "来源PMID": str(entry.get('pmid', 'N/A')),
+                            "文献标题": entry.get('title', '')[:60],
+                        })
+            
+            if all_sequences:
+                df_seqs = pd.DataFrame(all_sequences)
+                
+                st.dataframe(
+                    df_seqs,
+                    column_config={
+                        "序列 (5'-3')": st.column_config.TextColumn(width="large"),
+                        "来源PMID": st.column_config.LinkColumn(
+                            help="点击访问PubMed",
+                            display_text="查看文献",
+                            validate="^\\d+$"
+                        ),
+                        "GC含量(%)": st.column_config.NumberColumn(help="建议40-60%")
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                col_dl1, col_dl2 = st.columns(2)
+                with col_dl1:
+                    csv = df_seqs.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        label="📥 下载 CSV 格式",
+                        data=csv,
+                        file_name=f"{info['gene_symbol']}_靶点序列.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                with col_dl2:
+                    try:
+                        excel_buffer = io.BytesIO()
+                        df_seqs.to_excel(excel_buffer, index=False, engine='openpyxl')
+                        st.download_button(
+                            label="📥 下载 Excel 格式",
+                            data=excel_buffer.getvalue(),
+                            file_name=f"{info['gene_symbol']}_靶点序列.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                    except Exception:
+                        st.warning("Excel导出需安装：pip install openpyxl")
+                
+                st.caption(f"共提取到 {len(df_seqs)} 条序列 | 数据来源：PubMed文献文本挖掘")
+                
+                with st.expander("🔍 查看原始文本格式", expanded=False):
+                    for construct_type, seqs in lv['sequences'].items():
+                        if any(seqs.values()):
+                            st.markdown(f"**【{construct_type.upper()}】**")
+                            for seq_type, entries in seqs.items():
+                                if entries:
+                                    for entry in entries:
+                                        st.code(
+                                            f"{entry['sequence']} | {seq_type.upper()} | PMID:{entry.get('pmid', 'N/A')}", 
+                                            language="text"
+                                        )
+                            st.divider()
+            else:
+                st.info("未提取到符合要求的序列（需19-23bp，仅含ATCG）")
         
         # 通用文献统计
         st.divider()
-        st.subheader("通用基因表达调控文献")
+        st.subheader("📊 通用基因表达调控文献统计")
         cols = st.columns(3)
         for idx, ctype in enumerate(["overexpression", "knockdown", "knockout"]):
             with cols[idx]:
                 count = literature[ctype]["count"]
                 label = ctype.replace("overexpression", "OE").replace("knockdown", "KD").replace("knockout", "KO")
-                st.metric(label, f"{count} 篇")
+                st.metric(f"{label}文献", f"{count} 篇")
     
-    # Tab 4: 实验资源
+    # Tab 4: 实验资源（保持不变）
     with tabs[3]:
         st.subheader("Addgene 质粒资源")
         plasmids = result["addgene_plasmids"]
@@ -1269,3 +1330,4 @@ def display_results(result: Dict):
 
 if __name__ == "__main__":
     main()
+
