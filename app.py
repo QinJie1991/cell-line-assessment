@@ -68,7 +68,7 @@ if 'search_history' not in st.session_state:
 # ==================== Addgene 爬取模块 ====================
 
 class AddgeneScraper:
-    """Addgene 质粒爬取器 - 精简版"""
+    """Addgene 质粒爬取器 - 容错版"""
     
     def __init__(self):
         self.base_url = "https://www.addgene.org"
@@ -86,19 +86,24 @@ class AddgeneScraper:
             query = urllib.parse.quote(f"{gene_symbol}")
             search_url = f"{_self.base_url}/search/?q={query}&type=plasmid"
             headers = {'User-Agent': _self.ua.random}
-            time.sleep(1)
+            time.sleep(0.5)  # 增加延迟
             
-            response = _self.session.get(search_url, headers=headers, timeout=15)
+            response = _self.session.get(search_url, headers=headers, timeout=10)
             response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'lxml')
+            
+            # 容错：尝试多种解析器
+            try:
+                soup = BeautifulSoup(response.text, 'lxml')
+            except:
+                soup = BeautifulSoup(response.text, 'html.parser')  # 备用解析器
+            
             plasmids = []
             
+            # 多种选择器尝试
             result_items = (soup.find_all('article', class_='addgene-search-result') or 
                            soup.find_all('div', class_='search-result-item') or
-                           soup.select('.plasmid-item'))
-            
-            if not result_items:
-                result_items = soup.select('[data-testid="plasmid-card"]')
+                           soup.select('.plasmid-item') or
+                           soup.select('[data-testid="plasmid-card"]'))
             
             for item in result_items[:max_results]:
                 try:
@@ -114,7 +119,7 @@ class AddgeneScraper:
             return plasmids
             
         except Exception as e:
-            st.error(f"Addgene 爬取错误: {str(e)}")
+            st.warning(f"Addgene 暂时不可用: {str(e)[:100]}...")
             return []
     
     def _parse_plasmid_card(self, card, gene_symbol: str) -> Optional[Dict]:
@@ -136,10 +141,9 @@ class AddgeneScraper:
             name = name_tag.get_text(strip=True) if name_tag else "Unknown"
             
             name_lower = name.lower()
-            desc = card.get_text().lower()
             gene_lower = gene_symbol.lower()
             
-            if gene_lower not in name_lower and gene_lower not in desc:
+            if gene_lower not in name_lower and gene_lower not in card.get_text().lower():
                 return None
             
             return {
@@ -157,35 +161,42 @@ class AddgeneScraper:
         try:
             gene_url = f"{self.base_url}/browse/gene/{gene_symbol}/"
             headers = {'User-Agent': self.ua.random}
-            response = self.session.get(gene_url, headers=headers, timeout=10)
+            response = self.session.get(gene_url, headers=headers, timeout=8)
             
             if response.status_code != 200:
                 return []
             
-            soup = BeautifulSoup(response.text, 'lxml')
+            try:
+                soup = BeautifulSoup(response.text, 'lxml')
+            except:
+                soup = BeautifulSoup(response.text, 'html.parser')
+            
             plasmids = []
             seen_ids = set()
             
             links = soup.find_all('a', href=re.compile(r'/\d{5,6}/'))
             for link in links[:5]:
-                href = link.get('href', '')
-                match = re.search(r'/(\d{5,6})/', href)
-                if match:
-                    pid = match.group(1)
-                    if pid not in seen_ids:
-                        seen_ids.add(pid)
-                        name = link.get_text(strip=True) or f"{gene_symbol} related"
-                        
-                        if gene_symbol.lower() not in name.lower():
-                            continue
+                try:
+                    href = link.get('href', '')
+                    match = re.search(r'/(\d{5,6})/', href)
+                    if match:
+                        pid = match.group(1)
+                        if pid not in seen_ids:
+                            seen_ids.add(pid)
+                            name = link.get_text(strip=True) or f"{gene_symbol} related"
                             
-                        plasmids.append({
-                            'plasmid_id': pid,
-                            'name': name,
-                            'url': f"{self.base_url}/{pid}/",
-                            'insert_gene': gene_symbol,
-                            'source': 'Gene page'
-                        })
+                            if gene_symbol.lower() not in name.lower():
+                                continue
+                                
+                            plasmids.append({
+                                'plasmid_id': pid,
+                                'name': name,
+                                'url': f"{self.base_url}/{pid}/",
+                                'insert_gene': gene_symbol,
+                                'source': 'Gene page'
+                            })
+                except:
+                    continue
             return plasmids
         except Exception:
             return []
@@ -787,17 +798,20 @@ class BioDataFetcher:
         except:
             return ""
     
-    def get_all_transcripts(self, gene_symbol: str, species: str) -> Tuple[List[Dict], str]:
-        """获取所有RefSeq转录本并与UniProt比对"""
+   def get_all_transcripts(self, gene_symbol: str, species: str) -> Tuple[List[Dict], str]:
+        """获取所有RefSeq转录本 - 容错优化版"""
         transcripts = []
         uniprot_seq = ""
         
         try:
             # 1. 获取UniProt参考序列
-            uniprot_info = self.get_uniprot_info(gene_symbol, species)
-            if uniprot_info.get("status") == "success":
-                uniprot_id = uniprot_info.get("uniprot_id")
-                uniprot_seq = self.get_uniprot_sequence(uniprot_id)
+            try:
+                uniprot_info = self.get_uniprot_info(gene_symbol, species)
+                if uniprot_info.get("status") == "success":
+                    uniprot_id = uniprot_info.get("uniprot_id")
+                    uniprot_seq = self.get_uniprot_sequence(uniprot_id)
+            except Exception as e:
+                st.warning(f"UniProt序列获取失败，将跳过比对: {str(e)[:50]}")
             
             # 2. 获取Gene ID
             term = f"{gene_symbol}[Gene Name] AND {species}[Organism]"
@@ -810,11 +824,15 @@ class BioDataFetcher:
             
             gene_id = record["IdList"][0]
             
-            # 3. 获取转录本ID列表
-            handle = Entrez.elink(dbfrom="gene", db="nucleotide", id=gene_id, 
-                                linkname="gene_refseq_rna")
-            link_record = Entrez.read(handle)
-            handle.close()
+            # 3. 获取转录本ID列表（减少超时风险）
+            try:
+                handle = Entrez.elink(dbfrom="gene", db="nucleotide", id=gene_id, 
+                                    linkname="gene_refseq_rna")
+                link_record = Entrez.read(handle)
+                handle.close()
+            except Exception as e:
+                st.warning(f"NCBI连接不稳定，跳过转录本检索: {str(e)[:80]}")
+                return [], uniprot_seq
             
             transcript_ids = []
             if link_record and len(link_record) > 0:
@@ -826,46 +844,54 @@ class BioDataFetcher:
             if not transcript_ids:
                 return [], uniprot_seq
             
-            # 限制数量避免API过载
-            transcript_ids = transcript_ids[:15]
+            # 限制数量避免API过载（最多10个）
+            transcript_ids = transcript_ids[:10]
             
-            # 4. 批量获取详细信息
-            handle = Entrez.esummary(db="nucleotide", id=",".join(transcript_ids))
-            summaries = Entrez.read(handle)
-            handle.close()
-            
-            for summary in summaries:
-                accession = summary.get("AccessionVersion", "N/A")
-                title = summary.get("Title", "")
-                length = summary.get("Length", 0)
-                
-                # 只保留mRNA
-                if "mRNA" in title or "transcript variant" in title.lower():
-                    tx_data = {
-                        "transcript_id": accession,
-                        "title": title[:100],
-                        "length_nt": length,
-                        "protein_length_aa": None,
-                        "match_uniprot": False,
-                        "identity_percent": 0,
-                        "is_canonical": False
-                    }
+            # 4. 分批获取详细信息（避免一次性查询过多）
+            try:
+                # 分批处理，每批5个
+                batch_size = 5
+                for i in range(0, len(transcript_ids), batch_size):
+                    batch = transcript_ids[i:i+batch_size]
+                    time.sleep(0.5)  # 延迟避免超时
                     
-                    # 如果有CDS信息，估算蛋白长度
-                    if summary.get("GbQualifier_value"):
-                        for qual in summary.get("GbQualifier_value", []):
-                            if "protein_id" in str(qual):
-                                # 尝试获取蛋白长度
-                                try:
-                                    cds_start = int(summary.get("CdStart", 0))
-                                    cds_end = int(summary.get("CdStop", 0))
-                                    if cds_end > cds_start:
-                                        tx_data["protein_length_aa"] = (cds_end - cds_start) // 3
-                                except:
-                                    pass
-                                break
+                    handle = Entrez.esummary(db="nucleotide", id=",".join(batch))
+                    summaries = Entrez.read(handle)
+                    handle.close()
                     
-                    transcripts.append(tx_data)
+                    for summary in summaries:
+                        try:
+                            accession = summary.get("AccessionVersion", "N/A")
+                            title = summary.get("Title", "")
+                            length = summary.get("Length", 0)
+                            
+                            if "mRNA" in title or "transcript" in title.lower():
+                                tx_data = {
+                                    "transcript_id": accession,
+                                    "title": title[:80],
+                                    "length_nt": length,
+                                    "protein_length_aa": None,
+                                    "match_uniprot": False,
+                                    "identity_percent": 0,
+                                    "is_canonical": False
+                                }
+                                
+                                # 尝试估算蛋白长度
+                                if summary.get("CdStart") and summary.get("CdStop"):
+                                    try:
+                                        cds_len = int(summary["CdStop"]) - int(summary["CdStart"])
+                                        if cds_len > 0:
+                                            tx_data["protein_length_aa"] = cds_len // 3
+                                    except:
+                                        pass
+                                
+                                transcripts.append(tx_data)
+                        except:
+                            continue
+                            
+            except Exception as e:
+                st.warning(f"转录本详情获取失败: {str(e)[:80]}")
+                return [], uniprot_seq
             
             # 5. 比对到UniProt（基于长度相似性）
             if uniprot_seq and transcripts:
@@ -873,11 +899,9 @@ class BioDataFetcher:
                 for tx in transcripts:
                     if tx["protein_length_aa"]:
                         tx_len = tx["protein_length_aa"]
-                        # 计算长度相似度
-                        similarity = 1 - abs(tx_len - uniprot_len) / max(tx_len, uniprot_len)
+                        similarity = 1 - abs(tx_len - uniprot_len) / max(tx_len, uniprot_len, 1)
                         tx["identity_percent"] = round(similarity * 100, 1)
                         
-                        # 如果长度差异<5%，认为是经典转录本
                         if similarity > 0.95:
                             tx["match_uniprot"] = True
                             tx["is_canonical"] = True
@@ -888,7 +912,7 @@ class BioDataFetcher:
             return transcripts, uniprot_seq
             
         except Exception as e:
-            st.error(f"转录本检索错误: {str(e)}")
+            st.error(f"转录本检索错误: {str(e)[:100]}")
             return [], uniprot_seq
     
     def search_pmc_fulltext_europe(self, gene_symbol: str, construct_type: str, max_results: int = 5) -> List[Dict]:
@@ -1743,3 +1767,4 @@ def display_results(result: Dict):
 
 if __name__ == "__main__":
     main()
+
