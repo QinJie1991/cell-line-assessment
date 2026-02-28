@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-慢病毒与细胞系构建智能评估系统 V1
+慢病毒与细胞系构建智能评估系统 V2
+- Europe PMC全文深度挖掘
+- RefSeq转录本全景分析 + UniProt比对
 - 2000bp包装极限版 + 双分支文献检索
-- 整合HPA人类蛋白表达数据（自动下载）
-- 增强慢病毒风险评估（功能+文献+序列）
 """
 
 import streamlit as st
 import pandas as pd
 import requests
-from Bio import Entrez
+from Bio import Entrez, SeqIO
+from Bio.Seq import Seq
 from datetime import datetime
 import time
 import re
@@ -24,10 +25,11 @@ import openai
 import os
 import io
 import zipfile
+from difflib import SequenceMatcher
 
 # ==================== 配置与初始化 ====================
 st.set_page_config(
-    page_title="慢病毒与细胞系构建智能评估系统 V1",
+    page_title="慢病毒与细胞系构建智能评估系统 V2",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -429,7 +431,218 @@ class LentiviralRiskAssessor:
         return sequences
 
 
-# ==================== NCBI 数据获取模块 ====================
+# ==================== Europe PMC 全文检索模块 ====================
+
+class EuropePMCFetcher:
+    """Europe PMC API 全文检索"""
+    
+    def __init__(self):
+        self.base_url = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (compatible; LentiviralTool/1.0; research@lab.com)',
+            'Accept': 'application/json'
+        }
+    
+    def search_fulltext_articles(self, gene_symbol: str, construct_type: str, max_results: int = 10) -> List[Dict]:
+        """检索 Europe PMC 全文文章"""
+        try:
+            # 构建查询
+            type_keywords = {
+                "knockdown": "(shRNA OR siRNA OR knockdown)",
+                "knockout": "(CRISPR OR knockout OR sgRNA)",
+                "overexpression": "(overexpression OR lentiviral)"
+            }
+            
+            query = f'{gene_symbol} AND {type_keywords.get(construct_type, "")} AND (has_reflist:y OR has_fulltext:y)'
+            
+            # 搜索请求
+            search_url = f"{self.base_url}/search"
+            params = {
+                'query': query,
+                'format': 'json',
+                'pageSize': max_results,
+                'resultType': 'core'
+            }
+            
+            response = requests.get(search_url, params=params, headers=self.headers, timeout=20)
+            data = response.json()
+            
+            results = []
+            articles = data.get('resultList', {}).get('result', [])
+            
+            for article in articles:
+                pmcid = article.get('pmcid')
+                if pmcid and pmcid.startswith('PMC'):
+                    # 获取全文详情
+                    fulltext_data = self.fetch_fulltext_details(pmcid.replace('PMC', ''))
+                    if fulltext_data:
+                        results.append({
+                            'pmcid': pmcid,
+                            'title': article.get('title', 'N/A'),
+                            'authors': article.get('authorString', 'N/A'),
+                            'year': article.get('pubYear', 'N/A'),
+                            'doi': article.get('doi', 'N/A'),
+                            **fulltext_data
+                        })
+            
+            return results
+            
+        except Exception as e:
+            st.error(f"Europe PMC 检索错误: {str(e)}")
+            return []
+    
+    def fetch_fulltext_details(self, pmcid: str) -> Optional[Dict]:
+        """获取全文 Methods 部分"""
+        try:
+            # 使用 Europe PMC 全文 API
+            url = f"{self.base_url}/PMC{pmcid}/fullText"
+            
+            response = requests.get(url, headers=self.headers, timeout=15)
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            
+            # 提取 Methods 部分
+            sections = data.get('fullText', {}).get('sections', [])
+            methods_text = ""
+            
+            for section in sections:
+                title = section.get('title', '').lower()
+                if any(keyword in title for keyword in ['methods', 'materials', 'experimental']):
+                    paragraphs = section.get('paragraphs', [])
+                    methods_text = ' '.join([p.get('text', '') for p in paragraphs])
+                    break
+            
+            if not methods_text:
+                return None
+            
+            # 解析方法学细节
+            return self.parse_methods_details(methods_text)
+            
+        except Exception as e:
+            return None
+    
+    def parse_methods_details(self, text: str) -> Dict:
+        """解析方法学文本提取关键信息"""
+        text_lower = text.lower()
+        
+        # 提取细胞系
+        cell_lines = []
+        common_cells = [
+            "hek293", "hela", "a549", "mcf7", "hct116", "u2os", "nih3t3", 
+            "cos7", "hepg2", "mcf-10a", "mda-mb-231", "pc3", "du145"
+        ]
+        for cell in common_cells:
+            if cell in text_lower:
+                cell_lines.append(cell.upper())
+        
+        # 提取质粒载体（更全面的正则）
+        vectors = []
+        vector_patterns = [
+            r'([pP][Ll][Vv][A-Za-z0-9\-\.]+)',      # pLVX系列
+            r'([pP][Ll][Kk][Oo][\.\d]+)',           # pLKO.1
+            r'(lenti[a-zA-Z0-9\-]+)',               # lentiCRISPR
+            r'([pP][Cc][Dd][Hh][A-Za-z0-9\-]+)',    # pCDH
+            r'([pP][Ll][Ee][Nn][Tt][Ii][\-]?[a-zA-Z0-9]+)',  # pLenti
+            r'([pP][Ss][Pp][Aa][Xx]2?)',            # psPAX2
+            r'([pP][Mm][Dd]2\.?[Gg]?)',              # pMD2.G
+            r'([pP][Ll][Pp][Aa]1?)',                # pLPA1等包装质粒
+        ]
+        
+        for pattern in vector_patterns:
+            matches = re.findall(pattern, text)
+            vectors.extend(matches)
+        
+        vectors = list(set([v for v in vectors if len(v) > 2]))  # 去重且长度合理
+        
+        # 提取筛选标记浓度
+        selection = []
+        sel_patterns = [
+            r'(puromycin|g418|neomycin|blasticidin|hygromycin)[^\d]*(\d+\s*(?:μg|ug|mg)/(?:ml|mL))',
+            r'(\d+\s*(?:μg|ug)/ml)[^\w]*(puromycin|g418)',
+        ]
+        for pattern in sel_patterns:
+            matches = re.findall(pattern, text_lower)
+            for match in matches:
+                if isinstance(match, tuple):
+                    sel_text = ' '.join([m for m in match if m])
+                    selection.append(sel_text)
+                else:
+                    selection.append(match)
+        selection = list(set(selection))
+        
+        # 提取序列（高级模式）
+        sequences = self.extract_sequences_advanced(text)
+        
+        return {
+            'methods_text': text[:800] + "..." if len(text) > 800 else text,
+            'cell_lines': cell_lines[:5],
+            'vectors': vectors[:8],
+            'selection': selection[:5],
+            'sequences': sequences
+        }
+    
+    def extract_sequences_advanced(self, text: str) -> Dict[str, List[Dict]]:
+        """高级序列提取"""
+        results = {
+            'shrna': [],
+            'sirna': [],
+            'sgrna': []
+        }
+        
+        # shRNA 靶序列 + loop
+        shrna_patterns = [
+            (r'[Ss]h[Rr][Nn][Aa][^\n]{0,30}?([ACGTU]{19,21})[\s\-]+([ACGTU]{6,10})', 'target+loop'),
+            (r'target\s+sequence[:\s]+([ACGTU]{19,21})', 'target'),
+            (r'([ACGTU]{21})[\s\-]+[Tt][Cc][Aa][Aa][Gg][Aa][Gg]', 'classic_loop'),
+        ]
+        
+        for pattern, seq_type in shrna_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                if isinstance(match, tuple):
+                    seq = match[0].upper().replace('U', 'T')
+                else:
+                    seq = match.upper().replace('U', 'T')
+                
+                if len(seq) >= 19 and all(c in 'ATCG' for c in seq):
+                    results['shrna'].append({
+                        'sequence': seq,
+                        'type': seq_type,
+                        'gc': round((seq.count('G') + seq.count('C'))/len(seq)*100, 1)
+                    })
+        
+        # sgRNA
+        sgrna_patterns = [
+            r'[Ss][Gg][Rr][Nn][Aa][^\n]{0,20}?([ACGT]{20})[Gg]{2}',
+            r'guide\s+RNA[:\s]+([ACGT]{20,21})',
+            r'target\s+site[:\s]+([ACGT]{20})',
+        ]
+        for pattern in sgrna_patterns:
+            matches = re.findall(pattern, text)
+            for seq in matches:
+                seq = seq.upper()
+                if len(seq) >= 20:
+                    results['sgrna'].append({
+                        'sequence': seq[:20],
+                        'gc': round((seq.count('G') + seq.count('C'))/len(seq)*100, 1)
+                    })
+        
+        # 去重
+        for key in results:
+            seen = set()
+            unique = []
+            for item in results[key]:
+                if item['sequence'] not in seen:
+                    seen.add(item['sequence'])
+                    unique.append(item)
+            results[key] = unique[:5]
+        
+        return results
+
+
+# ==================== NCBI 数据获取模块（增强版） ====================
 
 class BioDataFetcher:
     def __init__(self, email: str, api_key: str = ""):
@@ -440,6 +653,7 @@ class BioDataFetcher:
         self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         self.addgene_scraper = AddgeneScraper()
         self.hpa_data = HPAGeneData()
+        self.europe_pmc = EuropePMCFetcher()
     
     def get_ncbi_gene_info(self, gene_symbol: str, species: str) -> Dict:
         try:
@@ -478,7 +692,7 @@ class BioDataFetcher:
             return {"status": "error", "error": str(e)}
     
     def get_uniprot_info(self, gene_symbol: str, species: str) -> Dict:
-        """增强版 UniProt 查询，支持多种匹配策略"""
+        """获取UniProt信息"""
         try:
             species_map = {
                 "Homo sapiens": ("human", 9606),
@@ -503,12 +717,7 @@ class BioDataFetcher:
                         "size": 5
                     }
                     
-                    response = requests.get(
-                        self.uniprot_base, 
-                        params=params, 
-                        headers=self.headers, 
-                        timeout=15
-                    )
+                    response = requests.get(self.uniprot_base, params=params, headers=self.headers, timeout=15)
                     data = response.json()
                     
                     if data.get("results"):
@@ -564,6 +773,127 @@ class BioDataFetcher:
             
         except Exception as e:
             return {"status": "error", "error": str(e)}
+    
+    def get_uniprot_sequence(self, uniprot_id: str) -> str:
+        """获取UniProt完整氨基酸序列"""
+        try:
+            url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.fasta"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                lines = response.text.strip().split('\n')
+                sequence = ''.join(lines[1:])  # 跳过头部
+                return sequence
+            return ""
+        except:
+            return ""
+    
+    def get_all_transcripts(self, gene_symbol: str, species: str) -> Tuple[List[Dict], str]:
+        """获取所有RefSeq转录本并与UniProt比对"""
+        transcripts = []
+        uniprot_seq = ""
+        
+        try:
+            # 1. 获取UniProt参考序列
+            uniprot_info = self.get_uniprot_info(gene_symbol, species)
+            if uniprot_info.get("status") == "success":
+                uniprot_id = uniprot_info.get("uniprot_id")
+                uniprot_seq = self.get_uniprot_sequence(uniprot_id)
+            
+            # 2. 获取Gene ID
+            term = f"{gene_symbol}[Gene Name] AND {species}[Organism]"
+            handle = Entrez.esearch(db="gene", term=term, retmax=1)
+            record = Entrez.read(handle)
+            handle.close()
+            
+            if not record["IdList"]:
+                return [], uniprot_seq
+            
+            gene_id = record["IdList"][0]
+            
+            # 3. 获取转录本ID列表
+            handle = Entrez.elink(dbfrom="gene", db="nucleotide", id=gene_id, 
+                                linkname="gene_refseq_rna")
+            link_record = Entrez.read(handle)
+            handle.close()
+            
+            transcript_ids = []
+            if link_record and len(link_record) > 0:
+                for link in link_record[0].get("LinkSetDb", []):
+                    if link.get("LinkName") == "gene_refseq_rna":
+                        for item in link.get("Link", []):
+                            transcript_ids.append(item.get("Id"))
+            
+            if not transcript_ids:
+                return [], uniprot_seq
+            
+            # 限制数量避免API过载
+            transcript_ids = transcript_ids[:15]
+            
+            # 4. 批量获取详细信息
+            handle = Entrez.esummary(db="nucleotide", id=",".join(transcript_ids))
+            summaries = Entrez.read(handle)
+            handle.close()
+            
+            for summary in summaries:
+                accession = summary.get("AccessionVersion", "N/A")
+                title = summary.get("Title", "")
+                length = summary.get("Length", 0)
+                
+                # 只保留mRNA
+                if "mRNA" in title or "transcript variant" in title.lower():
+                    tx_data = {
+                        "transcript_id": accession,
+                        "title": title[:100],
+                        "length_nt": length,
+                        "protein_length_aa": None,
+                        "match_uniprot": False,
+                        "identity_percent": 0,
+                        "is_canonical": False
+                    }
+                    
+                    # 如果有CDS信息，估算蛋白长度
+                    if summary.get("GbQualifier_value"):
+                        for qual in summary.get("GbQualifier_value", []):
+                            if "protein_id" in str(qual):
+                                # 尝试获取蛋白长度
+                                try:
+                                    cds_start = int(summary.get("CdStart", 0))
+                                    cds_end = int(summary.get("CdStop", 0))
+                                    if cds_end > cds_start:
+                                        tx_data["protein_length_aa"] = (cds_end - cds_start) // 3
+                                except:
+                                    pass
+                                break
+                    
+                    transcripts.append(tx_data)
+            
+            # 5. 比对到UniProt（基于长度相似性）
+            if uniprot_seq and transcripts:
+                uniprot_len = len(uniprot_seq)
+                for tx in transcripts:
+                    if tx["protein_length_aa"]:
+                        tx_len = tx["protein_length_aa"]
+                        # 计算长度相似度
+                        similarity = 1 - abs(tx_len - uniprot_len) / max(tx_len, uniprot_len)
+                        tx["identity_percent"] = round(similarity * 100, 1)
+                        
+                        # 如果长度差异<5%，认为是经典转录本
+                        if similarity > 0.95:
+                            tx["match_uniprot"] = True
+                            tx["is_canonical"] = True
+            
+            # 排序：匹配UniProt的排在前面
+            transcripts.sort(key=lambda x: (x["match_uniprot"], x["identity_percent"]), reverse=True)
+            
+            return transcripts, uniprot_seq
+            
+        except Exception as e:
+            st.error(f"转录本检索错误: {str(e)}")
+            return [], uniprot_seq
+    
+    def search_pmc_fulltext_europe(self, gene_symbol: str, construct_type: str, max_results: int = 5) -> List[Dict]:
+        """使用Europe PMC搜索全文"""
+        return self.europe_pmc.search_fulltext_articles(gene_symbol, construct_type, max_results)
 
 
 # ==================== 通义千问 AI 分析模块 ====================
@@ -723,25 +1053,37 @@ class ConstructAnalyzer:
             
             st.text("检索 NCBI Gene...")
             ncbi_info = self.fetcher.get_ncbi_gene_info(gene_symbol, species)
-            time.sleep(0.5)
+            time.sleep(0.3)
             
             st.text("检索 UniProt...")
             uniprot_info = self.fetcher.get_uniprot_info(gene_symbol, species)
-            time.sleep(0.5)
+            time.sleep(0.3)
+            
+            st.text("检索 RefSeq 转录本...")
+            transcripts, uniprot_seq = self.fetcher.get_all_transcripts(gene_symbol, species)
+            time.sleep(0.3)
             
             st.text("检索 Addgene...")
             addgene_plasmids = self.fetcher.addgene_scraper.search_plasmids(gene_symbol)
-            time.sleep(0.5)
+            time.sleep(0.3)
             
             hpa_gene_data = {}
             if species == "Homo sapiens":
                 st.text("检索 HPA 蛋白表达数据...")
                 hpa_gene_data = self.fetcher.hpa_data.get_gene_data(gene_symbol)
-            time.sleep(0.5)
+            time.sleep(0.3)
             
             st.text("检索文献...")
             literature = self._search_all_constructs(gene_symbol, cell_line)
-            time.sleep(0.5)
+            time.sleep(0.3)
+            
+            st.text("Europe PMC 全文检索...")
+            europe_pmc_data = {}
+            for ctype in ["knockdown", "knockout"]:
+                europe_pmc_data[ctype] = self.fetcher.search_pmc_fulltext_europe(
+                    gene_symbol, ctype, max_results=5
+                )
+            time.sleep(0.3)
             
             st.text("评估慢病毒风险...")
             lentiviral = self._assess_lentiviral_comprehensive(
@@ -789,10 +1131,13 @@ class ConstructAnalyzer:
                 },
                 "gene_function": ncbi_info,
                 "protein_data": uniprot_info,
+                "transcripts": transcripts,
+                "uniprot_sequence_length": len(uniprot_seq),
                 "hpa_gene_data": hpa_gene_data,
                 "addgene_plasmids": addgene_plasmids,
                 "lentiviral_assessment": lentiviral,
                 "cell_line_constructs": literature,
+                "europe_pmc_fulltext": europe_pmc_data,
                 "ai_analysis": ai_analysis,
                 "database_record": self._format_database_record(
                     gene_symbol, species, cell_line, ncbi_info, uniprot_info, 
@@ -1027,8 +1372,8 @@ class ConstructAnalyzer:
 # ==================== Streamlit UI ====================
 
 def main():
-    st.title("🔬 慢病毒与细胞系构建智能评估系统 V1")
-    st.markdown("**2000bp包装极限版 + 功能风险评估 + 序列提取**")
+    st.title("🔬 慢病毒与细胞系构建智能评估系统 V2")
+    st.markdown("**Europe PMC全文挖掘 + RefSeq转录本全景分析 + UniProt比对**")
     
     with st.sidebar:
         st.header("⚙️ 分析参数设置")
@@ -1061,13 +1406,11 @@ def main():
             st.caption("首次使用将自动下载（约30MB）")
         
         st.info("""
-        **系统功能：**
-        - ✅ NCBI/UniProt/HPA 多源数据
-        - ✅ CDS长度 + 功能风险双评估
-        - ✅ 文献包装证据检索
-        - ✅ shRNA/siRNA/sgRNA序列提取
-        - ✅ Addgene质粒查询
-        - ✅ AI智能分析
+        **V2 新功能：**
+        - ✅ Europe PMC全文深度挖掘（Methods部分）
+        - ✅ RefSeq转录本全景分析 + UniProt比对
+        - ✅ 自动识别质粒载体、细胞系、筛选条件
+        - ✅ 高亮显示经典转录本
         """)
     
     if analyze_btn and gene_symbol:
@@ -1106,57 +1449,100 @@ def display_results(result: Dict):
     cols[2].metric("细胞系", info['cell_line'])
     cols[3].metric("AI分析", "已启用" if info['ai_enabled'] else "未启用")
     
-    tabs = st.tabs(["🧬 基因功能", "🦠 慢病毒风险评估", "📚 文献与序列", "🧪 实验资源"])
+    tabs = st.tabs(["🧬 基因功能与转录本", "🦠 慢病毒风险评估", "📚 文献与序列", "🔬 Europe PMC全文", "🧪 实验资源"])
     
-    # Tab 1: 基因功能（保持不变）
+    # Tab 1: 基因功能与转录本（增强版）
     with tabs[0]:
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns([1, 2])
         
         with col1:
-            st.subheader("NCBI Gene")
+            st.subheader("基础信息")
+            
+            # NCBI信息
             gene_data = result["gene_function"]
             if gene_data.get("status") == "success":
-                st.write(f"**基因ID:** {gene_data.get('gene_id')}")
-                st.write(f"**染色体:** {gene_data.get('chromosome')}")
-                st.write(f"**必需性:** {gene_data.get('phenotype')}")
-                with st.expander("功能描述"):
-                    st.write(gene_data.get("description", "无"))
-            else:
-                st.error(gene_data.get("error", "无法获取基因信息"))
-        
-        with col2:
-            st.subheader("UniProt")
+                st.markdown("**NCBI Gene**")
+                st.write(f"基因ID: {gene_data.get('gene_id')}")
+                st.write(f"染色体: {gene_data.get('chromosome')}")
+                st.write(f"必需性: {gene_data.get('phenotype')}")
+            
+            st.divider()
+            
+            # UniProt信息
             prot_data = result["protein_data"]
             if prot_data.get("status") == "success":
-                st.write(f"**UniProt ID:** {prot_data.get('uniprot_id')}")
-                st.write(f"**蛋白长度:** {prot_data.get('protein_length')} aa")
-                st.write(f"**CDS长度:** {prot_data.get('cds_length_bp')} bp")
-                if prot_data.get("protein_name"):
-                    st.write(f"**蛋白名称:** {prot_data.get('protein_name')[:50]}...")
-                with st.expander("亚细胞定位"):
-                    st.write(prot_data.get("subcellular_location", "未标注"))
-            else:
-                st.error(prot_data.get("error", "无法获取蛋白信息"))
-        
-        with col3:
-            st.subheader("HPA 蛋白表达")
+                st.markdown("**UniProt**")
+                st.write(f"ID: {prot_data.get('uniprot_id')}")
+                st.write(f"蛋白长度: {prot_data.get('protein_length')} aa")
+                st.write(f"CDS长度: {prot_data.get('cds_length_bp')} bp")
+                
+                if result.get('uniprot_sequence_length'):
+                    st.caption(f"参考序列长度: {result['uniprot_sequence_length']} aa")
+            
+            st.divider()
+            
+            # HPA信息
             hpa_data = result.get("hpa_gene_data", {})
             if hpa_data:
-                st.write(f"**Ensembl:** {hpa_data.get('ensembl_id', 'N/A')}")
-                st.write(f"**可靠性:** {hpa_data.get('reliability', 'N/A')}")
-                if hpa_data.get('rna_tissue_specificity'):
-                    rna = str(hpa_data['rna_tissue_specificity'])
-                    if len(rna) > 50:
-                        rna = rna[:47] + "..."
-                    st.write(f"**RNA表达:** {rna}")
-                with st.expander("亚细胞定位"):
-                    st.write(hpa_data.get('subcellular_location', '未标注'))
-                st.caption(f"[HPA详情页]({hpa_data.get('hpa_link', '#')})")
+                st.markdown("**HPA表达**")
+                st.write(f"可靠性: {hpa_data.get('reliability', 'N/A')}")
+                st.caption(f"[查看HPA]({hpa_data.get('hpa_link', '#')})")
+        
+        with col2:
+            st.subheader("📋 RefSeq转录本全景分析")
+            
+            transcripts = result.get("transcripts", [])
+            if transcripts:
+                df_tx = pd.DataFrame(transcripts)
+                
+                # 高亮匹配UniProt的行
+                def highlight_matches(val):
+                    if isinstance(val, bool) and val:
+                        return 'background-color: rgba(75, 192, 192, 0.3); font-weight: bold'
+                    return ''
+                
+                # 应用样式
+                styled_df = df_tx.style.applymap(
+                    highlight_matches, 
+                    subset=['match_uniprot', 'is_canonical']
+                ).bar(
+                    subset=['identity_percent'], 
+                    color='#5fba7d',
+                    vmin=0, vmax=100
+                )
+                
+                st.dataframe(
+                    styled_df,
+                    column_config={
+                        "transcript_id": st.column_config.TextColumn("转录本ID", width="medium"),
+                        "title": st.column_config.TextColumn("描述", width="large"),
+                        "length_nt": st.column_config.NumberColumn("长度(nt)"),
+                        "protein_length_aa": st.column_config.NumberColumn("蛋白(aa)"),
+                        "match_uniprot": st.column_config.CheckboxColumn("匹配UniProt"),
+                        "is_canonical": st.column_config.CheckboxColumn("经典转录本"),
+                        "identity_percent": st.column_config.ProgressColumn(
+                            "一致性%", 
+                            help="与UniProt序列长度相似度",
+                            format="%.1f%%"
+                        )
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                match_count = sum(1 for t in transcripts if t.get('match_uniprot'))
+                st.caption(f"共 {len(transcripts)} 个转录本，{match_count} 个与UniProt经典序列高度匹配（绿色高亮）")
+                
+                # 下载按钮
+                csv = df_tx.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 下载转录本信息",
+                    data=csv,
+                    file_name=f"{info['gene_symbol']}_transcripts.csv",
+                    mime="text/csv"
+                )
             else:
-                if info['species'] == "Homo sapiens":
-                    st.info("未找到HPA数据")
-                else:
-                    st.info("HPA仅支持人类基因")
+                st.info("未找到RefSeq转录本信息")
     
     # Tab 2: 慢病毒风险评估（保持不变）
     with tabs[1]:
@@ -1187,20 +1573,13 @@ def display_results(result: Dict):
                     st.write(f"- {risk}")
             else:
                 st.write("未检测到特殊功能风险")
-            st.info(f"**策略建议:** {lv['function_risk']['recommendation']}")
-        
-        with st.expander("查看文献包装证据"):
-            ev = lv['literature_evidence']['evidence']
-            for construct, data in ev.items():
-                status = "✅" if data['available'] else "❌"
-                st.write(f"{status} **{construct}**: {data['count']}篇文献 ({data['method']})")
     
-    # Tab 3: 文献与序列（已修正）
+    # Tab 3: 文献与序列（PubMed摘要级）
     with tabs[2]:
         literature = result["cell_line_constructs"]
         lv = result["lentiviral_assessment"]
         
-        # 文献列表（特定细胞系）
+        # 特定细胞系文献
         if literature.get("specific_cell", {}).get("found"):
             st.success(literature["specific_cell"]["message"])
             
@@ -1217,13 +1596,8 @@ def display_results(result: Dict):
                             with st.expander(f"{article['title'][:80]}..."):
                                 st.write(f"**PMID:** {article['pmid']}")
                                 st.write(f"**方法:** {article['methods']}")
-                    
-                    if "ai_analysis" in data:
-                        st.markdown("**🤖 AI 方法学分析**")
-                        ai_data = data["ai_analysis"]
-                        st.write(ai_data.get("summary", ""))
         
-        # 提取的序列（整合表格版）
+        # 提取的序列表格
         if lv.get('sequences'):
             st.divider()
             st.subheader("🧬 文献报道的靶点序列")
@@ -1234,15 +1608,13 @@ def display_results(result: Dict):
                 for seq_type, entries in seqs.items():
                     for entry in entries:
                         seq = entry['sequence']
-                        gc_content = round((seq.count('G') + seq.count('C')) / len(seq) * 100, 1) if seq else 0
-                        
                         all_sequences.append({
                             "靶点类型": seq_type.upper(),
                             "构建类型": construct_type.upper(),
                             "序列 (5'-3')": seq,
                             "长度(bp)": len(seq),
-                            "GC含量(%)": gc_content,
-                            "来源PMID": str(entry.get('pmid', 'N/A')),
+                            "GC含量(%)": round((seq.count('G') + seq.count('C')) / len(seq) * 100, 1),
+                            "来源PMID": entry.get('pmid', 'N/A'),
                             "文献标题": entry.get('title', '')[:60],
                         })
             
@@ -1255,8 +1627,7 @@ def display_results(result: Dict):
                         "序列 (5'-3')": st.column_config.TextColumn(width="large"),
                         "来源PMID": st.column_config.LinkColumn(
                             help="点击访问PubMed",
-                            display_text="查看文献",
-                            validate="^\\d+$"
+                            display_text="查看文献"
                         ),
                         "GC含量(%)": st.column_config.NumberColumn(help="建议40-60%")
                     },
@@ -1268,7 +1639,7 @@ def display_results(result: Dict):
                 with col_dl1:
                     csv = df_seqs.to_csv(index=False).encode('utf-8')
                     st.download_button(
-                        label="📥 下载 CSV 格式",
+                        label="📥 下载 CSV",
                         data=csv,
                         file_name=f"{info['gene_symbol']}_靶点序列.csv",
                         mime="text/csv",
@@ -1279,44 +1650,86 @@ def display_results(result: Dict):
                         excel_buffer = io.BytesIO()
                         df_seqs.to_excel(excel_buffer, index=False, engine='openpyxl')
                         st.download_button(
-                            label="📥 下载 Excel 格式",
+                            label="📥 下载 Excel",
                             data=excel_buffer.getvalue(),
                             file_name=f"{info['gene_symbol']}_靶点序列.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
-                    except Exception:
-                        st.warning("Excel导出需安装：pip install openpyxl")
-                
-                st.caption(f"共提取到 {len(df_seqs)} 条序列 | 数据来源：PubMed文献文本挖掘")
-                
-                with st.expander("🔍 查看原始文本格式", expanded=False):
-                    for construct_type, seqs in lv['sequences'].items():
-                        if any(seqs.values()):
-                            st.markdown(f"**【{construct_type.upper()}】**")
-                            for seq_type, entries in seqs.items():
-                                if entries:
-                                    for entry in entries:
-                                        st.code(
-                                            f"{entry['sequence']} | {seq_type.upper()} | PMID:{entry.get('pmid', 'N/A')}", 
-                                            language="text"
-                                        )
-                            st.divider()
-            else:
-                st.info("未提取到符合要求的序列（需19-23bp，仅含ATCG）")
-        
-        # 通用文献统计
-        st.divider()
-        st.subheader("📊 通用基因表达调控文献统计")
-        cols = st.columns(3)
-        for idx, ctype in enumerate(["overexpression", "knockdown", "knockout"]):
-            with cols[idx]:
-                count = literature[ctype]["count"]
-                label = ctype.replace("overexpression", "OE").replace("knockdown", "KD").replace("knockout", "KO")
-                st.metric(f"{label}文献", f"{count} 篇")
+                    except:
+                        pass
     
-    # Tab 4: 实验资源（保持不变）
+    # Tab 4: Europe PMC全文分析（新增）
     with tabs[3]:
+        st.subheader("🔬 Europe PMC 全文方法学挖掘")
+        st.caption("从免费全文Methods部分提取质粒、细胞系、序列等详细信息")
+        
+        europe_data = result.get("europe_pmc_fulltext", {})
+        
+        if not europe_data or not any(europe_data.values()):
+            st.info("未检索到Europe PMC全文数据")
+        else:
+            for construct_type in ["knockdown", "knockout"]:
+                articles = europe_data.get(construct_type, [])
+                if not articles:
+                    continue
+                
+                with st.expander(f"{construct_type.upper()} - 找到 {len(articles)} 篇全文", expanded=True):
+                    for idx, article in enumerate(articles, 1):
+                        st.markdown(f"**{idx}. {article['title']}**")
+                        st.caption(f"PMC ID: {article['pmcid']} | 年份: {article.get('year', 'N/A')} | {article.get('authors', 'N/A')[:50]}...")
+                        
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.markdown("**🧫 细胞系:**")
+                            if article.get('cell_lines'):
+                                st.write(", ".join(article['cell_lines']))
+                            else:
+                                st.write("未明确提及")
+                            
+                            st.markdown("**🧬 质粒载体:**")
+                            if article.get('vectors'):
+                                for v in article['vectors'][:5]:
+                                    st.markdown(f"- `{v}`")
+                            else:
+                                st.write("未提取到")
+                        
+                        with col2:
+                            st.markdown("**💊 筛选条件:**")
+                            if article.get('selection'):
+                                for sel in article['selection']:
+                                    st.markdown(f"- {sel}")
+                            else:
+                                st.write("未提及")
+                        
+                        # 序列展示
+                        if article.get('sequences'):
+                            seq_data = article['sequences']
+                            has_seqs = any(seq_data.values())
+                            
+                            if has_seqs:
+                                st.markdown("**🎯 提取的序列:**")
+                                seq_cols = st.columns(3)
+                                
+                                col_idx = 0
+                                for seq_type, seq_list in seq_data.items():
+                                    if seq_list and col_idx < 3:
+                                        with seq_cols[col_idx]:
+                                            st.markdown(f"*{seq_type.upper()}*")
+                                            for s in seq_list[:3]:  # 每种类型最多显示3个
+                                                seq_text = s['sequence']
+                                                gc = s.get('gc', 0)
+                                                st.code(f"{seq_text}\nGC:{gc}%", language="text")
+                                        col_idx += 1
+                        
+                        with st.expander("查看Methods原文片段"):
+                            st.text(article.get('methods_text', '无内容')[:1000])
+                        
+                        st.divider()
+    
+    # Tab 5: 实验资源
+    with tabs[4]:
         st.subheader("Addgene 质粒资源")
         plasmids = result["addgene_plasmids"]
         
@@ -1330,4 +1743,3 @@ def display_results(result: Dict):
 
 if __name__ == "__main__":
     main()
-
