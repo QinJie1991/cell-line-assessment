@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-慢病毒与细胞系构建智能评估系统 V2
-- Europe PMC全文深度挖掘
-- RefSeq转录本全景分析 + UniProt比对
-- 2000bp包装极限版 + 双分支文献检索
+慢病毒与细胞系构建智能评估系统 V2.1
+- Europe PMC全文深度挖掘（JSON API）
+- RefSeq转录本全景分析 + UniProt比对高亮
+- 严格API速率限制（NCBI/UniProt/Europe PMC合规）
+- 增强容错机制（自动退避、分批查询、解析器回退）
 """
 
 import streamlit as st
 import pandas as pd
 import requests
-from Bio import Entrez, SeqIO
-from Bio.Seq import Seq
+from Bio import Entrez
 from datetime import datetime
 import time
 import re
@@ -25,11 +25,41 @@ import openai
 import os
 import io
 import zipfile
-from difflib import SequenceMatcher
 
-# ==================== 配置与初始化 ====================
+# ==================== 合规性配置与速率限制 ====================
+class RateLimiter:
+    """API速率限制器 - 严格遵守各平台政策"""
+    def __init__(self):
+        self.last_call_time = {}
+        self.min_intervals = {
+            'ncbi': 0.4,        # NCBI E-utilities: 每秒最多3次
+            'europe_pmc': 0.15, # Europe PMC: 每秒最多10次
+            'addgene': 1.0,     # Addgene: 每秒1次（礼貌爬虫）
+            'uniprot': 0.5,     # UniProt: 每秒2次
+            'generic': 0.3      # 通用延迟
+        }
+    
+    def wait(self, service: str):
+        """请求前调用，自动等待"""
+        service = service.lower()
+        min_interval = self.min_intervals.get(service, self.min_intervals['generic'])
+        
+        now = time.time()
+        last_call = self.last_call_time.get(service, 0)
+        elapsed = now - last_call
+        
+        if elapsed < min_interval:
+            sleep_time = min_interval - elapsed
+            time.sleep(sleep_time)
+        
+        self.last_call_time[service] = time.time()
+
+# 全局速率限制器
+rate_limiter = RateLimiter()
+
+# ==================== Streamlit配置 ====================
 st.set_page_config(
-    page_title="慢病毒与细胞系构建智能评估系统 V2",
+    page_title="慢病毒与细胞系构建智能评估系统 V2.1",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -46,6 +76,14 @@ except Exception:
     st.error("⚠️ 请先配置 Secrets（NCBI_EMAIL 等）")
     st.stop()
 
+# 合规性配置
+COMPLIANCE_CONFIG = {
+    'app_name': 'LentiviralAssessmentTool/2.1',
+    'contact_email': NCBI_EMAIL,
+    'max_retries': 3,
+    'backoff_factor': 2
+}
+
 # 密码保护
 if APP_PASSWORD:
     if 'authenticated' not in st.session_state:
@@ -59,16 +97,15 @@ if APP_PASSWORD:
             st.error("密码错误")
         st.stop()
 
-# 初始化 session state
+# 初始化session state
 if 'analysis_results' not in st.session_state:
     st.session_state.analysis_results = None
 if 'search_history' not in st.session_state:
     st.session_state.search_history = []
 
-# ==================== Addgene 爬取模块 ====================
-
+# ==================== Addgene爬取模块（容错版） ====================
 class AddgeneScraper:
-    """Addgene 质粒爬取器 - 容错版"""
+    """Addgene质粒爬取器 - 带解析器回退和速率限制"""
     
     def __init__(self):
         self.base_url = "https://www.addgene.org"
@@ -77,25 +114,28 @@ class AddgeneScraper:
         self.session.headers.update({
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
+            'From': COMPLIANCE_CONFIG['contact_email']
         })
+        self.rate_limiter = rate_limiter
     
     @st.cache_data(ttl=86400, show_spinner=False)
     def search_plasmids(_self, gene_symbol: str, max_results: int = 5) -> List[Dict]:
-        """搜索 Addgene 质粒"""
+        """搜索Addgene质粒"""
+        _self.rate_limiter.wait('addgene')
+        
         try:
             query = urllib.parse.quote(f"{gene_symbol}")
             search_url = f"{_self.base_url}/search/?q={query}&type=plasmid"
             headers = {'User-Agent': _self.ua.random}
-            time.sleep(0.5)  # 增加延迟
             
             response = _self.session.get(search_url, headers=headers, timeout=10)
             response.raise_for_status()
             
-            # 容错：尝试多种解析器
+            # 解析器回退：先尝试lxml，失败则用html.parser
             try:
                 soup = BeautifulSoup(response.text, 'lxml')
-            except:
-                soup = BeautifulSoup(response.text, 'html.parser')  # 备用解析器
+            except Exception:
+                soup = BeautifulSoup(response.text, 'html.parser')
             
             plasmids = []
             
@@ -119,7 +159,7 @@ class AddgeneScraper:
             return plasmids
             
         except Exception as e:
-            st.warning(f"Addgene 暂时不可用: {str(e)[:100]}...")
+            st.warning(f"Addgene检索暂时不可用: {str(e)[:100]}")
             return []
     
     def _parse_plasmid_card(self, card, gene_symbol: str) -> Optional[Dict]:
@@ -140,10 +180,7 @@ class AddgeneScraper:
             name_tag = card.find('h3') or card.find('h2') or card.find('a', class_='title')
             name = name_tag.get_text(strip=True) if name_tag else "Unknown"
             
-            name_lower = name.lower()
-            gene_lower = gene_symbol.lower()
-            
-            if gene_lower not in name_lower and gene_lower not in card.get_text().lower():
+            if gene_symbol.lower() not in name.lower() and gene_symbol.lower() not in card.get_text().lower():
                 return None
             
             return {
@@ -158,6 +195,8 @@ class AddgeneScraper:
     
     def _search_by_gene_page(self, gene_symbol: str) -> List[Dict]:
         """通过基因专属页面搜索"""
+        self.rate_limiter.wait('addgene')
+        
         try:
             gene_url = f"{self.base_url}/browse/gene/{gene_symbol}/"
             headers = {'User-Agent': self.ua.random}
@@ -168,7 +207,7 @@ class AddgeneScraper:
             
             try:
                 soup = BeautifulSoup(response.text, 'lxml')
-            except:
+            except Exception:
                 soup = BeautifulSoup(response.text, 'html.parser')
             
             plasmids = []
@@ -195,17 +234,15 @@ class AddgeneScraper:
                                 'insert_gene': gene_symbol,
                                 'source': 'Gene page'
                             })
-                except:
+                except Exception:
                     continue
             return plasmids
         except Exception:
             return []
 
-
-# ==================== HPA 基因表达数据模块 ====================
-
+# ==================== HPA基因表达数据模块 ====================
 class HPAGeneData:
-    """基于本地 proteinatlas.tsv 的人类蛋白表达数据查询"""
+    """基于本地proteinatlas.tsv的人类蛋白表达数据查询"""
     
     def __init__(self, tsv_path: str = "data/proteinatlas.tsv"):
         self.tsv_path = tsv_path
@@ -214,7 +251,7 @@ class HPAGeneData:
         self._load_data()
     
     def _load_data(self):
-        """加载 TSV 文件（兼容多版本）"""
+        """加载TSV文件（兼容多版本）"""
         try:
             if not os.path.exists(self.tsv_path):
                 self._auto_download()
@@ -234,20 +271,20 @@ class HPAGeneData:
                 if gene_col:
                     self.df = self.df.rename(columns={gene_col: 'Gene'})
                 else:
-                    st.error("HPA 文件中找不到基因名列")
+                    st.error("HPA文件中找不到基因名列")
                     self.df = pd.DataFrame()
                     return
             
-            st.success(f"✅ HPA 数据已加载: {len(self.df):,} 条基因")
+            st.success(f"✅ HPA数据已加载: {len(self.df):,}条基因")
             
         except Exception as e:
-            st.error(f"加载 HPA 数据失败: {e}")
+            st.error(f"加载HPA数据失败: {e}")
             self.df = pd.DataFrame()
     
     def _auto_download(self):
-        """自动下载 HPA 数据文件"""
+        """自动下载HPA数据文件"""
         try:
-            st.info("⬇️ 正在下载 HPA 数据...")
+            st.info("⬇️ 正在下载HPA数据...")
             os.makedirs("data", exist_ok=True)
             
             url = "https://www.proteinatlas.org/download/proteinatlas.tsv.zip"
@@ -260,7 +297,7 @@ class HPAGeneData:
                 zip_ref.extractall("data")
             
             os.remove("data/hpa_temp.zip")
-            st.success("✅ HPA 数据下载完成")
+            st.success("✅ HPA数据下载完成")
             
         except Exception as e:
             st.error(f"下载失败: {e}")
@@ -306,15 +343,13 @@ class HPAGeneData:
             return result
             
         except Exception as e:
-            st.error(f"查询 HPA 数据错误: {e}")
+            st.error(f"查询HPA数据错误: {e}")
             return {}
     
     def check_data_available(self) -> bool:
         return self.df is not None and not self.df.empty
 
-
 # ==================== 慢病毒风险评估类 ====================
-
 class LentiviralRiskAssessor:
     """慢病毒包装风险评估器"""
     
@@ -441,23 +476,24 @@ class LentiviralRiskAssessor:
         
         return sequences
 
-
-# ==================== Europe PMC 全文检索模块 ====================
-
+# ==================== Europe PMC全文检索模块 ====================
 class EuropePMCFetcher:
-    """Europe PMC API 全文检索"""
+    """Europe PMC API客户端 - 严格遵守10次/秒限制"""
     
-    def __init__(self):
+    def __init__(self, contact_email: str):
         self.base_url = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+        self.rate_limiter = rate_limiter
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (compatible; LentiviralTool/1.0; research@lab.com)',
-            'Accept': 'application/json'
+            'User-Agent': f'{COMPLIANCE_CONFIG["app_name"]} (mailto:{contact_email})',
+            'Accept': 'application/json',
+            'From': contact_email
         }
     
-    def search_fulltext_articles(self, gene_symbol: str, construct_type: str, max_results: int = 10) -> List[Dict]:
-        """检索 Europe PMC 全文文章"""
+    def search_fulltext_articles(self, gene_symbol: str, construct_type: str, max_results: int = 5) -> List[Dict]:
+        """检索Europe PMC全文文章 - 严格限速"""
+        self.rate_limiter.wait('europe_pmc')
+        
         try:
-            # 构建查询
             type_keywords = {
                 "knockdown": "(shRNA OR siRNA OR knockdown)",
                 "knockout": "(CRISPR OR knockout OR sgRNA)",
@@ -466,7 +502,6 @@ class EuropePMCFetcher:
             
             query = f'{gene_symbol} AND {type_keywords.get(construct_type, "")} AND (has_reflist:y OR has_fulltext:y)'
             
-            # 搜索请求
             search_url = f"{self.base_url}/search"
             params = {
                 'query': query,
@@ -475,7 +510,21 @@ class EuropePMCFetcher:
                 'resultType': 'core'
             }
             
-            response = requests.get(search_url, params=params, headers=self.headers, timeout=20)
+            response = requests.get(
+                search_url, 
+                params=params, 
+                headers=self.headers, 
+                timeout=20
+            )
+            
+            # 检查速率限制
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 2))
+                st.warning(f"Europe PMC速率限制，等待{retry_after}秒...")
+                time.sleep(retry_after)
+                return self.search_fulltext_articles(gene_symbol, construct_type, max_results)
+            
+            response.raise_for_status()
             data = response.json()
             
             results = []
@@ -484,8 +533,10 @@ class EuropePMCFetcher:
             for article in articles:
                 pmcid = article.get('pmcid')
                 if pmcid and pmcid.startswith('PMC'):
-                    # 获取全文详情
+                    # 获取全文详情（自动限速）
+                    self.rate_limiter.wait('europe_pmc')
                     fulltext_data = self.fetch_fulltext_details(pmcid.replace('PMC', ''))
+                    
                     if fulltext_data:
                         results.append({
                             'pmcid': pmcid,
@@ -498,23 +549,34 @@ class EuropePMCFetcher:
             
             return results
             
+        except requests.exceptions.RequestException as e:
+            st.error(f"Europe PMC网络错误: {str(e)[:100]}")
+            return []
         except Exception as e:
-            st.error(f"Europe PMC 检索错误: {str(e)}")
+            st.error(f"Europe PMC检索错误: {str(e)[:100]}")
             return []
     
     def fetch_fulltext_details(self, pmcid: str) -> Optional[Dict]:
-        """获取全文 Methods 部分"""
+        """获取全文Methods部分 - 带限速"""
         try:
-            # 使用 Europe PMC 全文 API
             url = f"{self.base_url}/PMC{pmcid}/fullText"
             
-            response = requests.get(url, headers=self.headers, timeout=15)
+            response = requests.get(
+                url, 
+                headers=self.headers, 
+                timeout=15
+            )
+            
+            if response.status_code == 429:
+                time.sleep(2)
+                response = requests.get(url, headers=self.headers, timeout=15)
+            
             if response.status_code != 200:
                 return None
             
             data = response.json()
             
-            # 提取 Methods 部分
+            # 提取Methods部分
             sections = data.get('fullText', {}).get('sections', [])
             methods_text = ""
             
@@ -528,10 +590,9 @@ class EuropePMCFetcher:
             if not methods_text:
                 return None
             
-            # 解析方法学细节
             return self.parse_methods_details(methods_text)
             
-        except Exception as e:
+        except Exception:
             return None
     
     def parse_methods_details(self, text: str) -> Dict:
@@ -548,24 +609,24 @@ class EuropePMCFetcher:
             if cell in text_lower:
                 cell_lines.append(cell.upper())
         
-        # 提取质粒载体（更全面的正则）
+        # 提取质粒载体
         vectors = []
         vector_patterns = [
-            r'([pP][Ll][Vv][A-Za-z0-9\-\.]+)',      # pLVX系列
-            r'([pP][Ll][Kk][Oo][\.\d]+)',           # pLKO.1
-            r'(lenti[a-zA-Z0-9\-]+)',               # lentiCRISPR
-            r'([pP][Cc][Dd][Hh][A-Za-z0-9\-]+)',    # pCDH
-            r'([pP][Ll][Ee][Nn][Tt][Ii][\-]?[a-zA-Z0-9]+)',  # pLenti
-            r'([pP][Ss][Pp][Aa][Xx]2?)',            # psPAX2
-            r'([pP][Mm][Dd]2\.?[Gg]?)',              # pMD2.G
-            r'([pP][Ll][Pp][Aa]1?)',                # pLPA1等包装质粒
+            r'([pP][Ll][Vv][A-Za-z0-9\-\.]+)',
+            r'([pP][Ll][Kk][Oo][\.\d]+)',
+            r'(lenti[a-zA-Z0-9\-]+)',
+            r'([pP][Cc][Dd][Hh][A-Za-z0-9\-]+)',
+            r'([pP][Ll][Ee][Nn][Tt][Ii][\-]?[a-zA-Z0-9]+)',
+            r'([pP][Ss][Pp][Aa][Xx]2?)',
+            r'([pP][Mm][Dd]2\.?[Gg]?)',
+            r'([pP][Ll][Pp][Aa]1?)',
         ]
         
         for pattern in vector_patterns:
             matches = re.findall(pattern, text)
             vectors.extend(matches)
         
-        vectors = list(set([v for v in vectors if len(v) > 2]))  # 去重且长度合理
+        vectors = list(set([v for v in vectors if len(v) > 2]))
         
         # 提取筛选标记浓度
         selection = []
@@ -583,7 +644,7 @@ class EuropePMCFetcher:
                     selection.append(match)
         selection = list(set(selection))
         
-        # 提取序列（高级模式）
+        # 提取序列
         sequences = self.extract_sequences_advanced(text)
         
         return {
@@ -602,7 +663,7 @@ class EuropePMCFetcher:
             'sgrna': []
         }
         
-        # shRNA 靶序列 + loop
+        # shRNA靶序列+loop
         shrna_patterns = [
             (r'[Ss]h[Rr][Nn][Aa][^\n]{0,30}?([ACGTU]{19,21})[\s\-]+([ACGTU]{6,10})', 'target+loop'),
             (r'target\s+sequence[:\s]+([ACGTU]{19,21})', 'target'),
@@ -652,24 +713,68 @@ class EuropePMCFetcher:
         
         return results
 
-
-# ==================== NCBI 数据获取模块（增强版） ====================
-
+# ==================== NCBI数据获取模块（增强合规版） ====================
 class BioDataFetcher:
+    """NCBI/UniProt/转录本数据获取 - 严格限速与错误处理"""
+    
     def __init__(self, email: str, api_key: str = ""):
+        # NCBI配置（必须）
         Entrez.email = email
         if api_key:
             Entrez.api_key = api_key
+        
+        self.email = email
+        self.api_key = api_key
         self.uniprot_base = "https://rest.uniprot.org/uniprotkb/search.json"
-        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        
+        # 统一的合规请求头
+        self.headers = {
+            'User-Agent': f'{COMPLIANCE_CONFIG["app_name"]} (mailto:{email})',
+            'From': email,
+            'Accept': 'application/json',
+            'Accept-Encoding': 'gzip, deflate'
+        }
+        
         self.addgene_scraper = AddgeneScraper()
         self.hpa_data = HPAGeneData()
-        self.europe_pmc = EuropePMCFetcher()
+        self.europe_pmc = EuropePMCFetcher(email)
+        self.rate_limiter = rate_limiter
+    
+    def _safe_ncbi_call(self, func, *args, **kwargs):
+        """带速率限制和错误处理的NCBI调用"""
+        self.rate_limiter.wait('ncbi')
+        
+        for attempt in range(COMPLIANCE_CONFIG['max_retries']):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                error_str = str(e).lower()
+                
+                # 检测速率限制错误
+                if any(x in error_str for x in ['rate limit', 'too many requests', '429']):
+                    wait_time = (attempt + 1) * COMPLIANCE_CONFIG['backoff_factor']
+                    st.warning(f"NCBI速率限制触发，等待{wait_time}秒后重试...")
+                    time.sleep(wait_time)
+                    continue
+                
+                # 检测服务器过载
+                if any(x in error_str for x in ['server error', '503', '502', 'timeout', 'eof']):
+                    wait_time = (attempt + 1) * COMPLIANCE_CONFIG['backoff_factor'] * 2
+                    st.warning(f"NCBI服务器繁忙，等待{wait_time}秒...")
+                    time.sleep(wait_time)
+                    continue
+                
+                # 其他错误直接抛出
+                raise
+        
+        raise Exception("NCBI请求多次失败，请稍后重试")
     
     def get_ncbi_gene_info(self, gene_symbol: str, species: str) -> Dict:
+        """获取NCBI基因信息 - 合规版"""
         try:
             term = f"{gene_symbol}[Gene Name] AND {species}[Organism]"
-            handle = Entrez.esearch(db="gene", term=term, retmax=1)
+            
+            handle = self._safe_ncbi_call(Entrez.esearch, db="gene", term=term, retmax=1)
             record = Entrez.read(handle)
             handle.close()
             
@@ -677,7 +782,8 @@ class BioDataFetcher:
                 return {"status": "not_found", "error": f"未找到 {gene_symbol} ({species})"}
             
             gene_id = record["IdList"][0]
-            handle = Entrez.efetch(db="gene", id=gene_id, rettype="xml")
+            
+            handle = self._safe_ncbi_call(Entrez.efetch, db="gene", id=gene_id, rettype="xml")
             gene_data = Entrez.read(handle)
             handle.close()
             
@@ -699,11 +805,14 @@ class BioDataFetcher:
                 "chromosome": gene_entry.get("Entrezgene_location", [{}])[0].get("Gene-location", {}).get("Gene-location_chromosome", "N/A"),
                 "status": "success"
             }
+            
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            return {"status": "error", "error": str(e)[:200]}
     
     def get_uniprot_info(self, gene_symbol: str, species: str) -> Dict:
-        """获取UniProt信息"""
+        """获取UniProt信息 - 合规版"""
+        self.rate_limiter.wait('uniprot')
+        
         try:
             species_map = {
                 "Homo sapiens": ("human", 9606),
@@ -728,7 +837,21 @@ class BioDataFetcher:
                         "size": 5
                     }
                     
-                    response = requests.get(self.uniprot_base, params=params, headers=self.headers, timeout=15)
+                    response = requests.get(
+                        self.uniprot_base, 
+                        params=params, 
+                        headers=self.headers, 
+                        timeout=15
+                    )
+                    
+                    # 检查速率限制
+                    if response.status_code == 429:
+                        retry_after = int(response.headers.get('Retry-After', 5))
+                        st.warning(f"UniProt速率限制，等待{retry_after}秒...")
+                        time.sleep(retry_after)
+                        continue
+                    
+                    response.raise_for_status()
                     data = response.json()
                     
                     if data.get("results"):
@@ -774,7 +897,8 @@ class BioDataFetcher:
                             "status": "success",
                             "match_type": "exact" if gene_symbol.upper() in gene_names else "partial"
                         }
-                except:
+                        
+                except Exception:
                     continue
             
             return {
@@ -783,23 +907,30 @@ class BioDataFetcher:
             }
             
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            return {"status": "error", "error": str(e)[:200]}
     
     def get_uniprot_sequence(self, uniprot_id: str) -> str:
-        """获取UniProt完整氨基酸序列"""
+        """获取UniProt完整氨基酸序列 - 合规版"""
+        self.rate_limiter.wait('uniprot')
+        
         try:
             url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.fasta"
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, headers=self.headers, timeout=10)
+            
+            if response.status_code == 429:
+                time.sleep(5)
+                response = requests.get(url, headers=self.headers, timeout=10)
+            
             if response.status_code == 200:
                 lines = response.text.strip().split('\n')
-                sequence = ''.join(lines[1:])  # 跳过头部
+                sequence = ''.join(lines[1:])
                 return sequence
             return ""
         except:
             return ""
     
-   def get_all_transcripts(self, gene_symbol: str, species: str) -> Tuple[List[Dict], str]:
-        """获取所有RefSeq转录本 - 容错优化版"""
+    def get_all_transcripts(self, gene_symbol: str, species: str) -> Tuple[List[Dict], str]:
+        """获取所有RefSeq转录本 - 严格限速与分批查询"""
         transcripts = []
         uniprot_seq = ""
         
@@ -815,7 +946,7 @@ class BioDataFetcher:
             
             # 2. 获取Gene ID
             term = f"{gene_symbol}[Gene Name] AND {species}[Organism]"
-            handle = Entrez.esearch(db="gene", term=term, retmax=1)
+            handle = self._safe_ncbi_call(Entrez.esearch, db="gene", term=term, retmax=1)
             record = Entrez.read(handle)
             handle.close()
             
@@ -824,10 +955,15 @@ class BioDataFetcher:
             
             gene_id = record["IdList"][0]
             
-            # 3. 获取转录本ID列表（减少超时风险）
+            # 3. 获取转录本ID列表
             try:
-                handle = Entrez.elink(dbfrom="gene", db="nucleotide", id=gene_id, 
-                                    linkname="gene_refseq_rna")
+                handle = self._safe_ncbi_call(
+                    Entrez.elink, 
+                    dbfrom="gene", 
+                    db="nucleotide", 
+                    id=gene_id, 
+                    linkname="gene_refseq_rna"
+                )
                 link_record = Entrez.read(handle)
                 handle.close()
             except Exception as e:
@@ -844,18 +980,20 @@ class BioDataFetcher:
             if not transcript_ids:
                 return [], uniprot_seq
             
-            # 限制数量避免API过载（最多10个）
+            # 严格限制数量（遵守NCBI政策）
             transcript_ids = transcript_ids[:10]
             
-            # 4. 分批获取详细信息（避免一次性查询过多）
-            try:
-                # 分批处理，每批5个
-                batch_size = 5
-                for i in range(0, len(transcript_ids), batch_size):
-                    batch = transcript_ids[i:i+batch_size]
-                    time.sleep(0.5)  # 延迟避免超时
-                    
-                    handle = Entrez.esummary(db="nucleotide", id=",".join(batch))
+            # 4. 分批获取详细信息（严格遵守每秒3次限制）
+            batch_size = 3  # 每批3个，配合0.4s延迟
+            for i in range(0, len(transcript_ids), batch_size):
+                batch = transcript_ids[i:i+batch_size]
+                
+                try:
+                    handle = self._safe_ncbi_call(
+                        Entrez.esummary, 
+                        db="nucleotide", 
+                        id=",".join(batch)
+                    )
                     summaries = Entrez.read(handle)
                     handle.close()
                     
@@ -889,9 +1027,9 @@ class BioDataFetcher:
                         except:
                             continue
                             
-            except Exception as e:
-                st.warning(f"转录本详情获取失败: {str(e)[:80]}")
-                return [], uniprot_seq
+                except Exception as e:
+                    st.warning(f"转录本批次 {i//batch_size + 1} 获取失败: {str(e)[:80]}")
+                    continue
             
             # 5. 比对到UniProt（基于长度相似性）
             if uniprot_seq and transcripts:
@@ -916,12 +1054,10 @@ class BioDataFetcher:
             return [], uniprot_seq
     
     def search_pmc_fulltext_europe(self, gene_symbol: str, construct_type: str, max_results: int = 5) -> List[Dict]:
-        """使用Europe PMC搜索全文"""
+        """Europe PMC全文检索入口"""
         return self.europe_pmc.search_fulltext_articles(gene_symbol, construct_type, max_results)
 
-
-# ==================== 通义千问 AI 分析模块 ====================
-
+# ==================== 通义千问AI分析模块 ====================
 class AIAnalyzer:
     def __init__(self):
         self.client = None
@@ -1061,9 +1197,7 @@ class AIAnalyzer:
         self.cache[cache_key] = result
         return result
 
-
 # ==================== 分析主类 ====================
-
 class ConstructAnalyzer:
     def __init__(self):
         self.fetcher = BioDataFetcher(NCBI_EMAIL, NCBI_API_KEY)
@@ -1077,29 +1211,29 @@ class ConstructAnalyzer:
             
             st.text("检索 NCBI Gene...")
             ncbi_info = self.fetcher.get_ncbi_gene_info(gene_symbol, species)
-            time.sleep(0.3)
+            time.sleep(0.1)
             
             st.text("检索 UniProt...")
             uniprot_info = self.fetcher.get_uniprot_info(gene_symbol, species)
-            time.sleep(0.3)
+            time.sleep(0.1)
             
             st.text("检索 RefSeq 转录本...")
             transcripts, uniprot_seq = self.fetcher.get_all_transcripts(gene_symbol, species)
-            time.sleep(0.3)
+            time.sleep(0.1)
             
             st.text("检索 Addgene...")
             addgene_plasmids = self.fetcher.addgene_scraper.search_plasmids(gene_symbol)
-            time.sleep(0.3)
+            time.sleep(0.1)
             
             hpa_gene_data = {}
             if species == "Homo sapiens":
                 st.text("检索 HPA 蛋白表达数据...")
                 hpa_gene_data = self.fetcher.hpa_data.get_gene_data(gene_symbol)
-            time.sleep(0.3)
+            time.sleep(0.1)
             
-            st.text("检索文献...")
+            st.text("检索 PubMed 文献...")
             literature = self._search_all_constructs(gene_symbol, cell_line)
-            time.sleep(0.3)
+            time.sleep(0.1)
             
             st.text("Europe PMC 全文检索...")
             europe_pmc_data = {}
@@ -1107,7 +1241,7 @@ class ConstructAnalyzer:
                 europe_pmc_data[ctype] = self.fetcher.search_pmc_fulltext_europe(
                     gene_symbol, ctype, max_results=5
                 )
-            time.sleep(0.3)
+            time.sleep(0.1)
             
             st.text("评估慢病毒风险...")
             lentiviral = self._assess_lentiviral_comprehensive(
@@ -1256,7 +1390,13 @@ class ConstructAnalyzer:
             query_specific = f'{gene_symbol}[Title/Abstract] AND {cell_line}[Title/Abstract] AND (cell line OR cell-line)'
             
             try:
-                handle = Entrez.esearch(db="pubmed", term=query_specific, retmax=100, sort="relevance")
+                handle = self.fetcher._safe_ncbi_call(
+                    Entrez.esearch, 
+                    db="pubmed", 
+                    term=query_specific, 
+                    retmax=100, 
+                    sort="relevance"
+                )
                 record = Entrez.read(handle)
                 handle.close()
                 
@@ -1264,7 +1404,13 @@ class ConstructAnalyzer:
                 
                 if pmids:
                     fetch_ids = pmids[:20]
-                    handle = Entrez.efetch(db="pubmed", id=fetch_ids, rettype="abstract", retmode="xml")
+                    handle = self.fetcher._safe_ncbi_call(
+                        Entrez.efetch, 
+                        db="pubmed", 
+                        id=fetch_ids, 
+                        rettype="abstract", 
+                        retmode="xml"
+                    )
                     articles = Entrez.read(handle)
                     handle.close()
                     
@@ -1327,7 +1473,13 @@ class ConstructAnalyzer:
             query = f'{gene_symbol}[Title/Abstract] AND ({type_map[construct_type]}) AND (cell line OR cell-line)'
             
             try:
-                handle = Entrez.esearch(db="pubmed", term=query, retmax=100, sort="relevance")
+                handle = self.fetcher._safe_ncbi_call(
+                    Entrez.esearch, 
+                    db="pubmed", 
+                    term=query, 
+                    retmax=100, 
+                    sort="relevance"
+                )
                 record = Entrez.read(handle)
                 handle.close()
                 
@@ -1336,7 +1488,13 @@ class ConstructAnalyzer:
                 
                 if pmids:
                     fetch_ids = pmids[:10]
-                    handle = Entrez.efetch(db="pubmed", id=fetch_ids, rettype="abstract", retmode="xml")
+                    handle = self.fetcher._safe_ncbi_call(
+                        Entrez.efetch, 
+                        db="pubmed", 
+                        id=fetch_ids, 
+                        rettype="abstract", 
+                        retmode="xml"
+                    )
                     articles = Entrez.read(handle)
                     handle.close()
                     
@@ -1392,12 +1550,10 @@ class ConstructAnalyzer:
             "timestamp": datetime.now().isoformat()
         }
 
-
 # ==================== Streamlit UI ====================
-
 def main():
-    st.title("🔬 慢病毒与细胞系构建智能评估系统 V2")
-    st.markdown("**Europe PMC全文挖掘 + RefSeq转录本全景分析 + UniProt比对**")
+    st.title("🔬 慢病毒与细胞系构建智能评估系统 V2.1")
+    st.markdown("**Europe PMC全文挖掘 + RefSeq转录本全景分析 + 严格API合规**")
     
     with st.sidebar:
         st.header("⚙️ 分析参数设置")
@@ -1424,17 +1580,17 @@ def main():
         
         hpa_checker = HPAGeneData()
         if hpa_checker.check_data_available():
-            st.success("✅ HPA 人类蛋白数据已加载")
+            st.success("✅ HPA人类蛋白数据已加载")
         else:
-            st.warning("⚠️ HPA 数据未配置")
+            st.warning("⚠️ HPA数据未配置")
             st.caption("首次使用将自动下载（约30MB）")
         
         st.info("""
-        **V2 新功能：**
-        - ✅ Europe PMC全文深度挖掘（Methods部分）
-        - ✅ RefSeq转录本全景分析 + UniProt比对
-        - ✅ 自动识别质粒载体、细胞系、筛选条件
-        - ✅ 高亮显示经典转录本
+        **系统功能：**
+        - ✅ Europe PMC全文Methods挖掘
+        - ✅ RefSeq转录本全景（UniProt比对高亮）
+        - ✅ 严格API速率限制（合规）
+        - ✅ 自动错误退避与重试
         """)
     
     if analyze_btn and gene_symbol:
@@ -1475,14 +1631,13 @@ def display_results(result: Dict):
     
     tabs = st.tabs(["🧬 基因功能与转录本", "🦠 慢病毒风险评估", "📚 文献与序列", "🔬 Europe PMC全文", "🧪 实验资源"])
     
-    # Tab 1: 基因功能与转录本（增强版）
+    # Tab 1: 基因功能与转录本
     with tabs[0]:
         col1, col2 = st.columns([1, 2])
         
         with col1:
             st.subheader("基础信息")
             
-            # NCBI信息
             gene_data = result["gene_function"]
             if gene_data.get("status") == "success":
                 st.markdown("**NCBI Gene**")
@@ -1492,7 +1647,6 @@ def display_results(result: Dict):
             
             st.divider()
             
-            # UniProt信息
             prot_data = result["protein_data"]
             if prot_data.get("status") == "success":
                 st.markdown("**UniProt**")
@@ -1505,7 +1659,6 @@ def display_results(result: Dict):
             
             st.divider()
             
-            # HPA信息
             hpa_data = result.get("hpa_gene_data", {})
             if hpa_data:
                 st.markdown("**HPA表达**")
@@ -1520,20 +1673,12 @@ def display_results(result: Dict):
                 df_tx = pd.DataFrame(transcripts)
                 
                 # 高亮匹配UniProt的行
-                def highlight_matches(val):
-                    if isinstance(val, bool) and val:
-                        return 'background-color: rgba(75, 192, 192, 0.3); font-weight: bold'
-                    return ''
+                def highlight_matches(row):
+                    if row['match_uniprot']:
+                        return ['background-color: rgba(75, 192, 192, 0.3); font-weight: bold'] * len(row)
+                    return [''] * len(row)
                 
-                # 应用样式
-                styled_df = df_tx.style.applymap(
-                    highlight_matches, 
-                    subset=['match_uniprot', 'is_canonical']
-                ).bar(
-                    subset=['identity_percent'], 
-                    color='#5fba7d',
-                    vmin=0, vmax=100
-                )
+                styled_df = df_tx.style.apply(highlight_matches, axis=1)
                 
                 st.dataframe(
                     styled_df,
@@ -1544,20 +1689,15 @@ def display_results(result: Dict):
                         "protein_length_aa": st.column_config.NumberColumn("蛋白(aa)"),
                         "match_uniprot": st.column_config.CheckboxColumn("匹配UniProt"),
                         "is_canonical": st.column_config.CheckboxColumn("经典转录本"),
-                        "identity_percent": st.column_config.ProgressColumn(
-                            "一致性%", 
-                            help="与UniProt序列长度相似度",
-                            format="%.1f%%"
-                        )
+                        "identity_percent": st.column_config.ProgressColumn("一致性%", format="%.1f%%", min_value=0, max_value=100)
                     },
                     use_container_width=True,
                     hide_index=True
                 )
                 
                 match_count = sum(1 for t in transcripts if t.get('match_uniprot'))
-                st.caption(f"共 {len(transcripts)} 个转录本，{match_count} 个与UniProt经典序列高度匹配（绿色高亮）")
+                st.caption(f"共{len(transcripts)}个转录本，{match_count}个与UniProt经典序列高度匹配（绿色高亮）")
                 
-                # 下载按钮
                 csv = df_tx.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="📥 下载转录本信息",
@@ -1568,7 +1708,7 @@ def display_results(result: Dict):
             else:
                 st.info("未找到RefSeq转录本信息")
     
-    # Tab 2: 慢病毒风险评估（保持不变）
+    # Tab 2: 慢病毒风险评估
     with tabs[1]:
         lv = result["lentiviral_assessment"]
         
@@ -1597,13 +1737,19 @@ def display_results(result: Dict):
                     st.write(f"- {risk}")
             else:
                 st.write("未检测到特殊功能风险")
+            st.info(f"**策略建议:** {lv['function_risk']['recommendation']}")
+        
+        with st.expander("查看文献包装证据"):
+            ev = lv['literature_evidence']['evidence']
+            for construct, data in ev.items():
+                status = "✅" if data['available'] else "❌"
+                st.write(f"{status} **{construct}**: {data['count']}篇文献 ({data['method']})")
     
     # Tab 3: 文献与序列（PubMed摘要级）
     with tabs[2]:
         literature = result["cell_line_constructs"]
         lv = result["lentiviral_assessment"]
         
-        # 特定细胞系文献
         if literature.get("specific_cell", {}).get("found"):
             st.success(literature["specific_cell"]["message"])
             
@@ -1620,8 +1766,12 @@ def display_results(result: Dict):
                             with st.expander(f"{article['title'][:80]}..."):
                                 st.write(f"**PMID:** {article['pmid']}")
                                 st.write(f"**方法:** {article['methods']}")
+                    
+                    if "ai_analysis" in data:
+                        st.markdown("**🤖 AI 方法学分析**")
+                        ai_data = data["ai_analysis"]
+                        st.write(ai_data.get("summary", ""))
         
-        # 提取的序列表格
         if lv.get('sequences'):
             st.divider()
             st.subheader("🧬 文献报道的靶点序列")
@@ -1649,10 +1799,7 @@ def display_results(result: Dict):
                     df_seqs,
                     column_config={
                         "序列 (5'-3')": st.column_config.TextColumn(width="large"),
-                        "来源PMID": st.column_config.LinkColumn(
-                            help="点击访问PubMed",
-                            display_text="查看文献"
-                        ),
+                        "来源PMID": st.column_config.LinkColumn(help="点击访问PubMed", display_text="查看文献"),
                         "GC含量(%)": st.column_config.NumberColumn(help="建议40-60%")
                     },
                     use_container_width=True,
@@ -1681,9 +1828,11 @@ def display_results(result: Dict):
                             use_container_width=True
                         )
                     except:
-                        pass
+                        st.info("Excel导出需安装openpyxl")
+                
+                st.caption(f"共提取到 {len(df_seqs)} 条序列 | 数据来源：PubMed文献文本挖掘")
     
-    # Tab 4: Europe PMC全文分析（新增）
+    # Tab 4: Europe PMC全文分析
     with tabs[3]:
         st.subheader("🔬 Europe PMC 全文方法学挖掘")
         st.caption("从免费全文Methods部分提取质粒、细胞系、序列等详细信息")
@@ -1727,7 +1876,6 @@ def display_results(result: Dict):
                             else:
                                 st.write("未提及")
                         
-                        # 序列展示
                         if article.get('sequences'):
                             seq_data = article['sequences']
                             has_seqs = any(seq_data.values())
@@ -1741,7 +1889,7 @@ def display_results(result: Dict):
                                     if seq_list and col_idx < 3:
                                         with seq_cols[col_idx]:
                                             st.markdown(f"*{seq_type.upper()}*")
-                                            for s in seq_list[:3]:  # 每种类型最多显示3个
+                                            for s in seq_list[:3]:
                                                 seq_text = s['sequence']
                                                 gc = s.get('gc', 0)
                                                 st.code(f"{seq_text}\nGC:{gc}%", language="text")
@@ -1767,4 +1915,3 @@ def display_results(result: Dict):
 
 if __name__ == "__main__":
     main()
-
