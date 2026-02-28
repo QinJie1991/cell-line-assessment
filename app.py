@@ -3,6 +3,7 @@
 慢病毒与细胞系构建智能评估系统 V1
 - 2000bp包装极限版 + 双分支文献检索
 - 整合HPA人类蛋白表达数据（自动下载）
+- 增强慢病毒风险评估（功能+文献+序列）
 """
 
 import streamlit as st
@@ -65,7 +66,7 @@ if 'search_history' not in st.session_state:
 # ==================== Addgene 爬取模块 ====================
 
 class AddgeneScraper:
-    """Addgene 质粒爬取器 - 精简版（仅匹配基因名）"""
+    """Addgene 质粒爬取器 - 精简版"""
     
     def __init__(self):
         self.base_url = "https://www.addgene.org"
@@ -78,7 +79,7 @@ class AddgeneScraper:
     
     @st.cache_data(ttl=86400, show_spinner=False)
     def search_plasmids(_self, gene_symbol: str, max_results: int = 5) -> List[Dict]:
-        """搜索 Addgene 质粒 - 仅返回基因名匹配的结果"""
+        """搜索 Addgene 质粒"""
         try:
             query = urllib.parse.quote(f"{gene_symbol}")
             search_url = f"{_self.base_url}/search/?q={query}&type=plasmid"
@@ -115,7 +116,7 @@ class AddgeneScraper:
             return []
     
     def _parse_plasmid_card(self, card, gene_symbol: str) -> Optional[Dict]:
-        """解析单个质粒卡片 - 仅提取基本信息和基因名匹配"""
+        """解析单个质粒卡片"""
         try:
             link_tag = card.find('a', href=re.compile(r'/\d{5,6}/')) or card.find('a', href=True)
             if not link_tag:
@@ -132,7 +133,6 @@ class AddgeneScraper:
             name_tag = card.find('h3') or card.find('h2') or card.find('a', class_='title')
             name = name_tag.get_text(strip=True) if name_tag else "Unknown"
             
-            # 严格匹配：基因名必须出现在质粒名称或描述中
             name_lower = name.lower()
             desc = card.get_text().lower()
             gene_lower = gene_symbol.lower()
@@ -189,173 +189,244 @@ class AddgeneScraper:
             return []
 
 
-# ==================== HPA 基因表达数据模块（自动下载版） ====================
+# ==================== HPA 基因表达数据模块 ====================
 
 class HPAGeneData:
-    """
-    基于本地 proteinatlas.tsv 的人类蛋白表达数据查询
-    首次使用自动从 Human Protein Atlas 官网下载
-    """
+    """基于本地 proteinatlas.tsv 的人类蛋白表达数据查询"""
     
     def __init__(self, tsv_path: str = "data/proteinatlas.tsv"):
         self.tsv_path = tsv_path
         self.df = None
         self.available_columns = []
-        
-        # 期望的列（按优先级）
-        self.desired_columns = {
-            'Gene': 'Gene',
-            'Ensembl': 'Ensembl',
-            'Uniprot': 'Uniprot',
-            'Subcellular main location': 'Subcellular main location',
-            'Reliability': 'Reliability',
-            'RNA tissue specific nTPM': 'RNA tissue specific nTPM'
-        }
-        
-        # 如果文件不存在，尝试自动下载
-        if not os.path.exists(self.tsv_path):
-            self._auto_download()
-        
         self._load_data()
     
-    def _auto_download(self):
-        """自动下载 HPA 数据文件（首次使用）"""
-        try:
-            st.warning("⬇️ 首次使用，正在下载 HPA 数据文件（约 30MB，请耐心等待）...")
-            
-            os.makedirs("data", exist_ok=True)
-            url = "https://www.proteinatlas.org/download/proteinatlas.tsv.zip"
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            response = requests.get(url, stream=True, timeout=300)
-            response.raise_for_status()
-            
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            chunk_size = 1024 * 1024
-            
-            zip_buffer = io.BytesIO()
-            
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    zip_buffer.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        progress = min(downloaded / total_size, 1.0)
-                        progress_bar.progress(progress)
-                        status_text.text(f"下载进度: {downloaded/1024/1024:.1f} MB / {total_size/1024/1024:.1f} MB")
-            
-            status_text.text("正在解压...")
-            
-            zip_buffer.seek(0)
-            with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
-                zip_ref.extractall("data")
-            
-            progress_bar.empty()
-            status_text.empty()
-            
-            if os.path.exists(self.tsv_path):
-                st.success("✅ HPA 数据下载完成！")
-                time.sleep(1)
-            else:
-                raise FileNotFoundError("解压后未找到 proteinatlas.tsv")
-                
-        except Exception as e:
-            st.error(f"❌ 自动下载失败: {e}")
-    
     def _load_data(self):
-        """加载 TSV 文件（自动检测列名）"""
+        """加载 TSV 文件（兼容多版本）"""
         try:
             if not os.path.exists(self.tsv_path):
-                st.warning("⚠️ HPA 数据文件未找到")
-                self.df = pd.DataFrame()
-                return
+                self._auto_download()
+                if not os.path.exists(self.tsv_path):
+                    return
             
-            # 先读取第一行看看有哪些列
-            sample_df = pd.read_csv(self.tsv_path, sep='\t', nrows=2)
-            actual_columns = sample_df.columns.tolist()
+            self.df = pd.read_csv(self.tsv_path, sep='\t', low_memory=False)
+            self.available_columns = self.df.columns.tolist()
+            self.df.columns = [col.strip() for col in self.df.columns]
             
-            # 找出实际存在的列（不区分大小写，容忍空格差异）
-            column_mapping = {}
-            for desired_col in self.desired_columns.keys():
-                # 精确匹配
-                if desired_col in actual_columns:
-                    column_mapping[desired_col] = desired_col
+            if 'Gene' not in self.df.columns:
+                gene_col = None
+                for col in self.df.columns:
+                    if 'gene' in col.lower():
+                        gene_col = col
+                        break
+                if gene_col:
+                    self.df = self.df.rename(columns={gene_col: 'Gene'})
                 else:
-                    # 尝试不区分大小写匹配
-                    for actual_col in actual_columns:
-                        if actual_col.lower().strip() == desired_col.lower().strip():
-                            column_mapping[desired_col] = actual_col
-                            break
+                    st.error("HPA 文件中找不到基因名列")
+                    self.df = pd.DataFrame()
+                    return
             
-            if not column_mapping:
-                st.error("HPA 文件中没有找到任何期望的列")
-                self.df = pd.DataFrame()
-                return
-            
-            # 只读取存在的列
-            cols_to_read = list(column_mapping.values())
-            self.df = pd.read_csv(
-                self.tsv_path, 
-                sep='\t', 
-                low_memory=False,
-                usecols=cols_to_read,
-                dtype=str  # 全部作为字符串读取，避免类型问题
-            )
-            
-            # 重命名为标准名称
-            reverse_mapping = {v: k for k, v in column_mapping.items()}
-            self.df = self.df.rename(columns=reverse_mapping)
-            
-            self.available_columns = list(column_mapping.keys())
-            
-            st.success(f"✅ HPA 数据已加载: {len(self.df):,} 条基因 (可用字段: {', '.join(self.available_columns)})")
+            st.success(f"✅ HPA 数据已加载: {len(self.df):,} 条基因")
             
         except Exception as e:
             st.error(f"加载 HPA 数据失败: {e}")
             self.df = pd.DataFrame()
     
+    def _auto_download(self):
+        """自动下载 HPA 数据文件"""
+        try:
+            st.info("⬇️ 正在下载 HPA 数据...")
+            os.makedirs("data", exist_ok=True)
+            
+            url = "https://www.proteinatlas.org/download/proteinatlas.tsv.zip"
+            response = requests.get(url, timeout=300)
+            
+            with open("data/hpa_temp.zip", "wb") as f:
+                f.write(response.content)
+            
+            with zipfile.ZipFile("data/hpa_temp.zip", 'r') as zip_ref:
+                zip_ref.extractall("data")
+            
+            os.remove("data/hpa_temp.zip")
+            st.success("✅ HPA 数据下载完成")
+            
+        except Exception as e:
+            st.error(f"下载失败: {e}")
+    
     def get_gene_data(self, gene_symbol: str) -> Dict:
-        """获取指定基因的表达数据"""
+        """获取基因数据"""
         if self.df is None or self.df.empty:
             return {}
         
         try:
-            matches = self.df[self.df['Gene'].str.upper() == gene_symbol.upper()]
-            
-            if matches.empty:
+            mask = self.df['Gene'].str.upper() == gene_symbol.upper()
+            if not mask.any():
                 return {}
             
-            row = matches.iloc[0]
-            
-            # 只返回实际存在的字段
+            row = self.df[mask].iloc[0]
             result = {}
-            if 'Ensembl' in self.available_columns:
-                result['ensembl_id'] = str(row.get('Ensembl', ''))
-            if 'Uniprot' in self.available_columns:
-                result['uniprot_id'] = str(row.get('Uniprot', ''))
-            if 'Subcellular main location' in self.available_columns:
-                result['subcellular_location'] = str(row.get('Subcellular main location', ''))
-            if 'Reliability' in self.available_columns:
-                result['reliability'] = str(row.get('Reliability', ''))
-            if 'RNA tissue specific nTPM' in self.available_columns:
-                result['rna_tissue_specificity'] = str(row.get('RNA tissue specific nTPM', ''))
             
-            # 构建链接（如果有 Ensembl）
-            if 'ensembl_id' in result and result['ensembl_id']:
+            if 'Ensembl' in self.df.columns:
+                result['ensembl_id'] = str(row['Ensembl'])
+            if 'Uniprot' in self.df.columns:
+                result['uniprot_id'] = str(row['Uniprot'])
+            if 'Subcellular main location' in self.df.columns:
+                result['subcellular_location'] = str(row['Subcellular main location'])
+            elif 'Subcellular location' in self.df.columns:
+                result['subcellular_location'] = str(row['Subcellular location'])
+            
+            rna_col = None
+            for col in self.df.columns:
+                if 'tissue' in col.lower() and 'rna' in col.lower():
+                    rna_col = col
+                    break
+            if rna_col:
+                result['rna_tissue_specificity'] = str(row[rna_col])
+            
+            if 'Reliability' in self.df.columns:
+                result['reliability'] = str(row['Reliability'])
+            else:
+                result['reliability'] = 'N/A'
+            
+            if 'ensembl_id' in result:
                 result['hpa_link'] = f"https://www.proteinatlas.org/{result['ensembl_id']}"
             
             return result
             
         except Exception as e:
-            st.error(f"查询 HPA 基因数据失败: {e}")
+            st.error(f"查询 HPA 数据错误: {e}")
             return {}
     
     def check_data_available(self) -> bool:
-        """检查数据是否可用"""
         return self.df is not None and not self.df.empty
+
+
+# ==================== 慢病毒风险评估类 ====================
+
+class LentiviralRiskAssessor:
+    """慢病毒包装风险评估器"""
+    
+    def __init__(self):
+        self.risk_keywords = {
+            "high": {
+                "antiviral": ["interferon", "ifn", "antiviral", "innate immunity", "rig-i", "tlr", "sting", "mavs", "irf"],
+                "toxic": ["lethal", "essential", "cell death", "apoptosis", "toxic", "fatal"],
+                "proliferation": ["cell cycle arrest", "growth inhibition", "anti-proliferative", "tumor suppressor", "contact inhibition"],
+                "structure": ["transmembrane domain", "secreted protein", "extracellular matrix", "collagen"]
+            },
+            "medium": {
+                "signaling": ["kinase", "phosphatase", "signal transduction", "pathway"],
+                "transcription": ["transcription factor", "nuclear receptor", "epigenetic"]
+            }
+        }
+    
+    def assess_by_function(self, gene_description: str, phenotype: str) -> Dict:
+        """根据基因功能评估风险"""
+        desc_lower = gene_description.lower()
+        risks = []
+        risk_level = "low"
+        
+        for level, categories in self.risk_keywords.items():
+            for category, keywords in categories.items():
+                matched = [kw for kw in keywords if kw in desc_lower]
+                if matched:
+                    risks.append(f"{category}: 检测到关键词 {matched[:2]}...")
+                    if level == "high":
+                        risk_level = "high"
+                    elif level == "medium" and risk_level != "high":
+                        risk_level = "medium"
+        
+        if "必需" in phenotype or "lethal" in phenotype.lower() or "essential" in phenotype.lower():
+            risks.append("致死性: 必需基因，敲除可能导致细胞死亡")
+            risk_level = "high"
+        
+        return {
+            "risk_level": risk_level,
+            "risks": risks,
+            "recommendation": self._get_recommendation(risk_level, risks)
+        }
+    
+    def _get_recommendation(self, risk_level: str, risks: List[str]) -> str:
+        """根据风险等级给出建议"""
+        if risk_level == "high":
+            return "⚠️ 高风险：建议使用诱导型系统(Tet-On/Off)或暂时性敲低(shRNA)，避免直接KO"
+        elif risk_level == "medium":
+            return "⚡ 中等风险：可进行KO但需密切监测细胞状态，建议准备诱导型备选方案"
+        else:
+            return "✅ 低风险：标准KO方案适用，预期可获得稳定细胞系"
+    
+    def assess_by_literature(self, literature_data: Dict) -> Dict:
+        """根据文献评估包装可行性"""
+        oe_count = literature_data.get("overexpression", {}).get("count", 0)
+        kd_count = literature_data.get("knockdown", {}).get("count", 0)
+        ko_count = literature_data.get("knockout", {}).get("count", 0)
+        
+        evidence = {
+            "overexpression": {"available": oe_count > 0, "count": oe_count, "method": "慢病毒包装"},
+            "knockdown": {"available": kd_count > 0, "count": kd_count, "method": "shRNA/siRNA"},
+            "knockout": {"available": ko_count > 0, "count": ko_count, "method": "CRISPR/Cas9"}
+        }
+        
+        if oe_count > 10:
+            packaging_feasibility = "high"
+        elif oe_count > 0:
+            packaging_feasibility = "medium"
+        else:
+            packaging_feasibility = "unknown"
+        
+        return {
+            "evidence": evidence,
+            "packaging_feasibility": packaging_feasibility,
+            "has_precedent": oe_count > 0 or kd_count > 0 or ko_count > 0
+        }
+    
+    def extract_sequences_from_literature(self, articles: List[Dict]) -> Dict:
+        """从文献中提取shRNA/siRNA/sgRNA序列"""
+        sequences = {
+            "shrna": [],
+            "sirna": [],
+            "sgrna": []
+        }
+        
+        patterns = {
+            "shrna": r'(?:shRNA|shRNA\s+sequence)[:\s]+([ACGTU]{19,23})',
+            "sirna": r'(?:siRNA|siRNA\s+sequence)[:\s]+([ACGTU]{19,23})',
+            "sgrna": r'(?:sgRNA|gRNA|guide\s+RNA)[:\s]+([ACGTU]{20,23})',
+            "target_seq": r'target\s+sequence[:\s]+([ACGTU]{19,23})',
+            "forward": r'[Ff]orward[:\s]+([ACGTU]{19,23})',
+            "sense": r'[Ss]ense[:\s]+([ACGTU]{19,23})'
+        }
+        
+        for article in articles:
+            text = article.get("title", "") + " " + article.get("abstract_snippet", "")
+            
+            for seq_type, pattern in patterns.items():
+                matches = re.findall(pattern, text)
+                for match in matches:
+                    seq = match[0] if isinstance(match, tuple) else match
+                    seq = seq.upper().replace("U", "T")
+                    
+                    if len(seq) >= 19 and len(seq) <= 23 and all(c in "ATCG" for c in seq):
+                        entry = {
+                            "sequence": seq,
+                            "pmid": article.get("pmid"),
+                            "title": article.get("title", "")[:50] + "..." if len(article.get("title", "")) > 50 else article.get("title", ""),
+                            "type": seq_type
+                        }
+                        
+                        if "shrna" in seq_type.lower():
+                            if not any(e["sequence"] == seq for e in sequences["shrna"]):
+                                sequences["shrna"].append(entry)
+                        elif "sirna" in seq_type.lower():
+                            if not any(e["sequence"] == seq for e in sequences["sirna"]):
+                                sequences["sirna"].append(entry)
+                        elif "grna" in seq_type.lower() or "sgrna" in seq_type.lower():
+                            if not any(e["sequence"] == seq for e in sequences["sgrna"]):
+                                sequences["sgrna"].append(entry)
+        
+        for seq_type in sequences:
+            sequences[seq_type] = sequences[seq_type][:5]
+        
+        return sequences
 
 
 # ==================== NCBI 数据获取模块 ====================
@@ -368,7 +439,6 @@ class BioDataFetcher:
         self.uniprot_base = "https://rest.uniprot.org/uniprotkb/search.json"
         self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         self.addgene_scraper = AddgeneScraper()
-        # 关键：使用 HPAGeneData（不是 HumanAtlasScraper）
         self.hpa_data = HPAGeneData()
     
     def get_ncbi_gene_info(self, gene_symbol: str, species: str) -> Dict:
@@ -399,7 +469,7 @@ class BioDataFetcher:
                 "gene_id": gene_id,
                 "symbol": gene_symbol,
                 "species": species,
-                "description": summary[:500] if summary else "无描述",
+                "description": summary[:800] if summary else "无描述",
                 "phenotype": phenotype,
                 "chromosome": gene_entry.get("Entrezgene_location", [{}])[0].get("Gene-location", {}).get("Gene-location_chromosome", "N/A"),
                 "status": "success"
@@ -408,45 +478,90 @@ class BioDataFetcher:
             return {"status": "error", "error": str(e)}
     
     def get_uniprot_info(self, gene_symbol: str, species: str) -> Dict:
+        """增强版 UniProt 查询，支持多种匹配策略"""
         try:
-            species_map = {"Homo sapiens": "human", "Mus musculus": "mouse", "Rattus norvegicus": "rat"}
-            org = species_map.get(species, species.lower())
-            
-            query = f"gene:{gene_symbol}+organism:{org}"
-            params = {
-                "query": query,
-                "fields": "accession,gene_names,length,cc_subcellular_location,sequence",
-                "format": "json",
-                "size": 1
+            species_map = {
+                "Homo sapiens": ("human", 9606),
+                "Mus musculus": ("mouse", 10090),
+                "Rattus norvegicus": ("rat", 10116)
             }
+            org_name, tax_id = species_map.get(species, (species.lower(), None))
             
-            response = requests.get(self.uniprot_base, params=params, headers=self.headers, timeout=10)
-            data = response.json()
+            queries = [
+                f"gene:{gene_symbol}+organism_id:{tax_id}",
+                f"gene:{gene_symbol}+organism:{org_name}",
+                f"{gene_symbol}+organism:{org_name}",
+                gene_symbol
+            ]
             
-            if not data.get("results"):
-                return {"status": "not_found", "error": f"UniProt 未找到 {gene_symbol}"}
-            
-            protein = data["results"][0]
-            accession = protein.get("primaryAccession", "")
-            seq_length = protein.get("sequence", {}).get("length", 0)
-            
-            loc_text = ""
-            comments = protein.get("comments", [])
-            for comment in comments:
-                if comment.get("commentType") == "SUBCELLULAR LOCATION":
-                    locations = comment.get("subcellularLocations", [])
-                    locs = [loc.get("location", {}).get("value", "") for loc in locations]
-                    loc_text = "; ".join([l for l in locs if l])
-            
-            cds_length = seq_length * 3 if seq_length else 0
+            for query in queries:
+                try:
+                    params = {
+                        "query": query,
+                        "fields": "accession,gene_names,length,cc_subcellular_location,sequence,protein_name",
+                        "format": "json",
+                        "size": 5
+                    }
+                    
+                    response = requests.get(
+                        self.uniprot_base, 
+                        params=params, 
+                        headers=self.headers, 
+                        timeout=15
+                    )
+                    data = response.json()
+                    
+                    if data.get("results"):
+                        best_match = None
+                        gene_names = []
+                        
+                        for protein in data["results"]:
+                            genes = protein.get("genes", [])
+                            for g in genes:
+                                if g.get("geneName"):
+                                    gene_names.append(g["geneName"].get("value", "").upper())
+                                if g.get("synonyms"):
+                                    for syn in g["synonyms"]:
+                                        gene_names.append(syn.get("value", "").upper())
+                            
+                            if gene_symbol.upper() in gene_names:
+                                best_match = protein
+                                break
+                        
+                        if not best_match:
+                            best_match = data["results"][0]
+                        
+                        accession = best_match.get("primaryAccession", "")
+                        seq_length = best_match.get("sequence", {}).get("length", 0)
+                        
+                        loc_text = ""
+                        comments = best_match.get("comments", [])
+                        for comment in comments:
+                            if comment.get("commentType") == "SUBCELLULAR LOCATION":
+                                locations = comment.get("subcellularLocations", [])
+                                locs = [loc.get("location", {}).get("value", "") 
+                                       for loc in locations if loc.get("location")]
+                                loc_text = "; ".join([l for l in locs if l])
+                        
+                        cds_length = seq_length * 3 if seq_length else 0
+                        
+                        return {
+                            "uniprot_id": accession,
+                            "protein_length": seq_length,
+                            "cds_length_bp": cds_length,
+                            "subcellular_location": loc_text or "未标注",
+                            "protein_name": best_match.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value", ""),
+                            "status": "success",
+                            "match_type": "exact" if gene_symbol.upper() in gene_names else "partial"
+                        }
+                except:
+                    continue
             
             return {
-                "uniprot_id": accession,
-                "protein_length": seq_length,
-                "cds_length_bp": cds_length,
-                "subcellular_location": loc_text or "未标注",
-                "status": "success"
+                "status": "not_found",
+                "error": f"UniProt 未找到 {gene_symbol}，请确认基因符号"
             }
+            
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
@@ -463,7 +578,7 @@ class AIAnalyzer:
             api_key = BAILIAN_API_KEY
             
             if not api_key:
-                raise ValueError("未配置 BAILIAN_API_KEY 或 DASHSCOPE_API_KEY")
+                raise ValueError("未配置 BAILIAN_API_KEY")
             
             self.model = AI_MODEL
             
@@ -598,6 +713,7 @@ class AIAnalyzer:
 class ConstructAnalyzer:
     def __init__(self):
         self.fetcher = BioDataFetcher(NCBI_EMAIL, NCBI_API_KEY)
+        self.risk_assessor = LentiviralRiskAssessor()
     
     def analyze_gene(self, gene_symbol: str, species: str, 
                     cell_line: Optional[str] = None, 
@@ -617,15 +733,20 @@ class ConstructAnalyzer:
             addgene_plasmids = self.fetcher.addgene_scraper.search_plasmids(gene_symbol)
             time.sleep(0.5)
             
-            # 仅人类基因查询HPA数据
             hpa_gene_data = {}
             if species == "Homo sapiens":
                 st.text("检索 HPA 蛋白表达数据...")
                 hpa_gene_data = self.fetcher.hpa_data.get_gene_data(gene_symbol)
             time.sleep(0.5)
             
-            lentiviral = self._assess_lentiviral(ncbi_info, uniprot_info, addgene_plasmids)
+            st.text("检索文献...")
             literature = self._search_all_constructs(gene_symbol, cell_line)
+            time.sleep(0.5)
+            
+            st.text("评估慢病毒风险...")
+            lentiviral = self._assess_lentiviral_comprehensive(
+                gene_symbol, ncbi_info, uniprot_info, literature
+            )
             
             ai_analysis = {}
             try:
@@ -636,7 +757,6 @@ class ConstructAnalyzer:
                         ncbi_info, uniprot_info
                     )
                     
-                    # AI分析特定细胞的文献（如果有）
                     if cell_line and literature.get("specific_cell", {}).get("found"):
                         for ctype in ["overexpression", "knockdown", "knockout"]:
                             if literature["specific_cell"][ctype]["articles"]:
@@ -645,7 +765,6 @@ class ConstructAnalyzer:
                                 )
                                 literature["specific_cell"][ctype]["ai_analysis"] = ai_result
                     
-                    # AI分析通用文献
                     for ctype in ["overexpression", "knockdown", "knockout"]:
                         if literature[ctype]["articles"]:
                             ai_result = ai_analyzer.analyze_literature_deep(
@@ -683,44 +802,87 @@ class ConstructAnalyzer:
             
             return result
     
-    def _assess_lentiviral(self, ncbi_info: Dict, uniprot_info: Dict, plasmids: List) -> Dict:
-        """评估慢病毒适用性 - 2000bp极限简化版"""
-        warnings = []
-        recommendations = []
+    def _assess_lentiviral_comprehensive(self, gene_symbol: str, ncbi_info: Dict, 
+                                        uniprot_info: Dict, literature: Dict) -> Dict:
+        """综合评估慢病毒适用性"""
         cds_len = uniprot_info.get("cds_length_bp", 0)
         
-        # 致死性判断
-        if ncbi_info.get("phenotype") == "必需（潜在致死风险）":
-            warnings.append("🚨 必需基因，敲除可能导致细胞致死，建议使用诱导型系统")
-        
-        # 长度判断
-        if cds_len > 2000:
-            warnings.append(f"⚠️ 长度超限（{cds_len}bp > 2000bp）")
-            warnings.append("💡 建议：去除荧光标签或使用split-vector系统")
-            suitable = False
-            rating = "❌ 不推荐（长度超限）"
+        # 1. CDS长度评估
+        if cds_len > 2500:
+            cds_risk = {"level": "high", "suitable": False, "reason": f"CDS过长({cds_len}bp)，远超2000bp推荐值"}
+        elif cds_len > 2000:
+            cds_risk = {"level": "medium", "suitable": True, "reason": f"CDS较长({cds_len}bp)，建议使用第三代系统"}
+        elif cds_len == 0:
+            cds_risk = {"level": "unknown", "suitable": True, "reason": "无法获取CDS长度信息"}
         else:
-            suitable = True
-            rating = "✅ 可接受"
+            cds_risk = {"level": "low", "suitable": True, "reason": f"CDS长度合适({cds_len}bp)"}
         
-        # Addgene资源提示
-        if plasmids:
-            recommendations.append(f"Addgene 提供 {len(plasmids)} 个质粒")
+        # 2. 基因功能风险评估
+        function_risk = self.risk_assessor.assess_by_function(
+            ncbi_info.get("description", ""),
+            ncbi_info.get("phenotype", "")
+        )
+        
+        # 3. 文献证据评估
+        lit_evidence = self.risk_assessor.assess_by_literature(literature)
+        
+        # 4. 提取序列
+        sequences = {}
+        for ctype in ["knockdown", "knockout"]:
+            if literature[ctype].get("articles"):
+                seqs = self.risk_assessor.extract_sequences_from_literature(
+                    literature[ctype]["articles"]
+                )
+                if any(seqs.values()):
+                    sequences[ctype] = seqs
+        
+        # 综合建议
+        recommendations = []
+        warnings = []
+        
+        if cds_risk["level"] == "high":
+            warnings.append(f"⚠️ 长度风险: {cds_risk['reason']}")
+            recommendations.append("建议使用split-vector系统或选择其他递送方式（如转座子）")
+        elif cds_risk["level"] == "medium":
+            warnings.append(f"⚡ 长度警告: {cds_risk['reason']}")
+        
+        if function_risk["risk_level"] == "high":
+            warnings.append(f"🚨 功能风险: {', '.join(function_risk['risks'][:2])}")
+            recommendations.append("强烈建议使用诱导型表达系统（Tet-On/Off）")
+        elif function_risk["risk_level"] == "medium":
+            warnings.append(f"⚡ 功能注意: {', '.join(function_risk['risks'][:1])}")
+        
+        if not lit_evidence["has_precedent"]:
+            warnings.append("📚 文献缺乏: 未找到该基因的病毒包装文献记录")
+            recommendations.append("建议先进行小规模包装测试")
+        else:
+            if lit_evidence["evidence"]["overexpression"]["available"]:
+                recommendations.append("✅ 文献支持: 已有成功过表达记录")
+        
+        # 总体评级
+        if cds_risk["level"] == "high" or function_risk["risk_level"] == "high":
+            overall_rating = "❌ 高风险（不推荐标准方案）"
+        elif cds_risk["level"] == "medium" or function_risk["risk_level"] == "medium":
+            overall_rating = "⚠️ 中等风险（需优化方案）"
+        else:
+            overall_rating = "✅ 低风险（标准方案适用）"
         
         return {
-            "suitable": suitable,
-            "cds_length": cds_len,
-            "packaging_limit": 2000,
+            "cds_assessment": cds_risk,
+            "function_risk": function_risk,
+            "literature_evidence": lit_evidence,
+            "sequences": sequences,
             "warnings": warnings,
             "recommendations": recommendations,
-            "overall_assessment": rating
+            "overall_rating": overall_rating,
+            "overall_suitable": cds_risk["suitable"] and function_risk["risk_level"] != "high"
         }
     
     def _search_all_constructs(self, gene_symbol: str, cell_line: Optional[str]) -> Dict:
         """双分支文献检索"""
         results = {}
         
-        # 分支1：特定目的细胞系构建
+        # 分支1：特定细胞系
         if cell_line:
             query_specific = f'{gene_symbol}[Title/Abstract] AND {cell_line}[Title/Abstract] AND (cell line OR cell-line)'
             
@@ -750,13 +912,14 @@ class ConstructAnalyzer:
                             pmid = str(medline.get("PMID", "N/A"))
                             title_display = article_data.get("ArticleTitle", "N/A")
                             
-                            methods = [kw for kw in ["lentiviral", "transfection", "electroporation"] if kw in full_text]
+                            methods = [kw for kw in ["lentiviral", "transfection", "electroporation", "transduction"] if kw in full_text]
                             
                             article_info = {
                                 "pmid": pmid,
                                 "title": title_display,
                                 "methods": ", ".join(methods) if methods else "未明确提及",
-                                "cell_line": cell_line
+                                "cell_line": cell_line,
+                                "abstract_snippet": abstract[:300] if len(abstract) > 300 else abstract
                             }
                             
                             if any(kw in full_text for kw in ["overexpression", "over-expression", "ectopic"]):
@@ -775,7 +938,7 @@ class ConstructAnalyzer:
                         "overexpression": {"articles": specific_oe[:5], "count": len(specific_oe)},
                         "knockdown": {"articles": specific_kd[:5], "count": len(specific_kd)},
                         "knockout": {"articles": specific_ko[:5], "count": len(specific_ko)},
-                        "message": f"在 {cell_line} 中找到 {len(pmids)} 篇文献（OE:{len(specific_oe)} KD:{len(specific_kd)} KO:{len(specific_ko)}）"
+                        "message": f"在 {cell_line} 中找到 {len(pmids)} 篇文献"
                     }
                 else:
                     results["specific_cell"] = {"found": False, "message": f"未在 {cell_line} 中找到相关研究"}
@@ -784,7 +947,7 @@ class ConstructAnalyzer:
         else:
             results["specific_cell"] = {"found": False, "message": "未输入细胞系名称"}
         
-        # 分支2：通用表达调控文献
+        # 分支2：通用文献
         for construct_type in ["overexpression", "knockdown", "knockout"]:
             type_map = {
                 "overexpression": "overexpression OR over-expression OR ectopic",
@@ -848,7 +1011,8 @@ class ConstructAnalyzer:
             "ensembl_id": hpa_gene_data.get("ensembl_id"),
             "cds_length": uniprot_info.get("cds_length_bp"),
             "is_essential": ncbi_info.get("phenotype") == "必需（潜在致死风险）",
-            "lentiviral_suitable": lentiviral.get("suitable"),
+            "lentiviral_suitable": lentiviral.get("overall_suitable"),
+            "lentiviral_risk": lentiviral.get("function_risk", {}).get("risk_level"),
             "literature_count": {
                 "oe": literature.get("overexpression", {}).get("count", 0),
                 "kd": literature.get("knockdown", {}).get("count", 0),
@@ -864,7 +1028,7 @@ class ConstructAnalyzer:
 
 def main():
     st.title("🔬 慢病毒与细胞系构建智能评估系统 V1")
-    st.markdown("**2000bp包装极限版 + 双分支文献检索 + AI 智能分析**")
+    st.markdown("**2000bp包装极限版 + 功能风险评估 + 序列提取**")
     
     with st.sidebar:
         st.header("⚙️ 分析参数设置")
@@ -889,8 +1053,7 @@ def main():
         
         st.divider()
         
-        # HPA 数据状态提示
-        hpa_checker = HPAGeneData()  # 临时实例检查状态
+        hpa_checker = HPAGeneData()
         if hpa_checker.check_data_available():
             st.success("✅ HPA 人类蛋白数据已加载")
         else:
@@ -899,12 +1062,12 @@ def main():
         
         st.info("""
         **系统功能：**
-        - ✅ NCBI/UniProt 基因信息检索
-        - ✅ Addgene 质粒资源查询
-        - ✅ HPA 人类蛋白表达数据（自动下载）
-        - ✅ 2000bp 慢病毒包装极限评估
-        - ✅ PubMed 双分支文献检索
-        - ✅ 通义千问 AI 智能分析
+        - ✅ NCBI/UniProt/HPA 多源数据
+        - ✅ CDS长度 + 功能风险双评估
+        - ✅ 文献包装证据检索
+        - ✅ shRNA/siRNA/sgRNA序列提取
+        - ✅ Addgene质粒查询
+        - ✅ AI智能分析
         """)
     
     if analyze_btn and gene_symbol:
@@ -927,8 +1090,8 @@ def main():
             
         except Exception as e:
             st.error(f"分析过程出错: {e}")
+            st.exception(e)
     
-    # 显示结果
     if st.session_state.analysis_results:
         display_results(st.session_state.analysis_results)
 
@@ -943,9 +1106,9 @@ def display_results(result: Dict):
     cols[2].metric("细胞系", info['cell_line'])
     cols[3].metric("AI分析", "已启用" if info['ai_enabled'] else "未启用")
     
-    tabs = st.tabs(["🧬 基因功能", "🦠 慢病毒评估", "📚 文献检索", "🧪 实验资源"])
+    tabs = st.tabs(["🧬 基因功能", "🦠 慢病毒风险评估", "📚 文献与序列", "🧪 实验资源"])
     
-    # Tab 1: 基因功能（包含HPA数据）
+    # Tab 1: 基因功能
     with tabs[0]:
         col1, col2, col3 = st.columns(3)
         
@@ -968,6 +1131,8 @@ def display_results(result: Dict):
                 st.write(f"**UniProt ID:** {prot_data.get('uniprot_id')}")
                 st.write(f"**蛋白长度:** {prot_data.get('protein_length')} aa")
                 st.write(f"**CDS长度:** {prot_data.get('cds_length_bp')} bp")
+                if prot_data.get("protein_name"):
+                    st.write(f"**蛋白名称:** {prot_data.get('protein_name')[:50]}...")
                 with st.expander("亚细胞定位"):
                     st.write(prot_data.get("subcellular_location", "未标注"))
             else:
@@ -979,10 +1144,11 @@ def display_results(result: Dict):
             if hpa_data:
                 st.write(f"**Ensembl:** {hpa_data.get('ensembl_id', 'N/A')}")
                 st.write(f"**可靠性:** {hpa_data.get('reliability', 'N/A')}")
-                rna_expr = hpa_data.get('rna_tissue_specificity', 'N/A')
-                if len(str(rna_expr)) > 50:
-                    rna_expr = str(rna_expr)[:47] + "..."
-                st.write(f"**RNA表达:** {rna_expr}")
+                if hpa_data.get('rna_tissue_specificity'):
+                    rna = str(hpa_data['rna_tissue_specificity'])
+                    if len(rna) > 50:
+                        rna = rna[:47] + "..."
+                    st.write(f"**RNA表达:** {rna}")
                 with st.expander("亚细胞定位"):
                     st.write(hpa_data.get('subcellular_location', '未标注'))
                 st.caption(f"[HPA详情页]({hpa_data.get('hpa_link', '#')})")
@@ -992,37 +1158,53 @@ def display_results(result: Dict):
                 else:
                     st.info("HPA仅支持人类基因")
     
-    # Tab 2: 慢病毒评估
+    # Tab 2: 慢病毒风险评估
     with tabs[1]:
-        lentiviral = result["lentiviral_assessment"]
+        lv = result["lentiviral_assessment"]
+        
+        st.subheader("综合风险评估")
         
         col1, col2, col3 = st.columns(3)
-        col1.metric("CDS长度", f"{lentiviral['cds_length']} bp")
-        col2.metric("包装极限", "2000 bp")
-        col3.metric("评估结果", lentiviral['overall_assessment'])
+        col1.metric("CDS长度风险", lv['cds_assessment']['level'].upper(), 
+                   help=lv['cds_assessment']['reason'])
+        col2.metric("功能风险等级", lv['function_risk']['risk_level'].upper(),
+                   help="基于基因功能描述的风险评估")
+        col3.metric("总体评级", lv['overall_rating'].split()[0])
         
-        if lentiviral['warnings']:
-            st.error("**警告:**")
-            for warning in lentiviral['warnings']:
-                st.write(warning)
+        # 警告信息
+        if lv['warnings']:
+            st.error("**⚠️ 风险提示:**")
+            for warning in lv['warnings']:
+                st.write(f"- {warning}")
         
-        if lentiviral['recommendations']:
-            st.info("**建议:**")
-            for rec in lentiviral['recommendations']:
+        # 建议
+        if lv['recommendations']:
+            st.success("**💡 专家建议:**")
+            for rec in lv['recommendations']:
                 st.write(f"- {rec}")
         
-        st.divider()
-        st.markdown("""
-        **2000bp 极限说明:**
-        - 第三代慢病毒系统包装容量约 8kb（含载体骨架）
-        - 实际插入片段建议 ≤2000bp 以确保滴度
-        - 超过 2000bp 建议：使用 split-vector 系统或选择其他递送方式
-        """)
+        # 功能风险详情
+        with st.expander("查看功能风险详情"):
+            if lv['function_risk']['risks']:
+                for risk in lv['function_risk']['risks']:
+                    st.write(f"- {risk}")
+            else:
+                st.write("未检测到特殊功能风险")
+            st.info(f"**策略建议:** {lv['function_risk']['recommendation']}")
+        
+        # 文献证据
+        with st.expander("查看文献包装证据"):
+            ev = lv['literature_evidence']['evidence']
+            for construct, data in ev.items():
+                status = "✅" if data['available'] else "❌"
+                st.write(f"{status} **{construct}**: {data['count']}篇文献 ({data['method']})")
     
-    # Tab 3: 文献检索
+    # Tab 3: 文献与序列
     with tabs[2]:
         literature = result["cell_line_constructs"]
+        lv = result["lentiviral_assessment"]
         
+        # 文献列表
         if literature.get("specific_cell", {}).get("found"):
             st.success(literature["specific_cell"]["message"])
             
@@ -1044,14 +1226,27 @@ def display_results(result: Dict):
                         st.markdown("**🤖 AI 方法学分析**")
                         ai_data = data["ai_analysis"]
                         st.write(ai_data.get("summary", ""))
-                        if ai_data.get("common_methods"):
-                            st.info(f"常用方法: {ai_data['common_methods']}")
-        else:
-            st.warning(literature.get("specific_cell", {}).get("message", "未检索特定细胞系文献"))
         
+        # 提取的序列
+        if lv.get('sequences'):
+            st.divider()
+            st.subheader("🧬 文献报道的靶点序列")
+            
+            for construct_type, seqs in lv['sequences'].items():
+                if any(seqs.values()):
+                    with st.expander(f"{construct_type.upper()} 序列", expanded=True):
+                        for seq_type, entries in seqs.items():
+                            if entries:
+                                st.text(f"{seq_type.upper()} 序列 (来自文献):")
+                                for entry in entries:
+                                    cols = st.columns([2, 1, 3])
+                                    cols[0].code(entry['sequence'])
+                                    cols[1].caption(f"PMID: {entry['pmid']}")
+                                    cols[2].caption(entry['title'][:40])
+        
+        # 通用文献统计
         st.divider()
         st.subheader("通用基因表达调控文献")
-        
         cols = st.columns(3)
         for idx, ctype in enumerate(["overexpression", "knockdown", "knockout"]):
             with cols[idx]:
@@ -1074,4 +1269,3 @@ def display_results(result: Dict):
 
 if __name__ == "__main__":
     main()
-
